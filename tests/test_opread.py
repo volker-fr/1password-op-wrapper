@@ -75,15 +75,19 @@ class OpreadTests(unittest.TestCase):
 
     def test_resolver_reports_probe_failure_and_timeout(self):
         with tempfile.TemporaryDirectory() as directory:
-            executable = self.make_fake_op(directory)
-            with mock.patch.dict(opread.os.environ, {"PATH": directory}, clear=False), \
-                 mock.patch.object(opread.subprocess, "run", return_value=mock.Mock(returncode=7)):
+            self.make_fake_op(directory)
+            failed = Child(7)
+            with mock.patch.object(opread.subprocess, "Popen", return_value=failed), \
+                 mock.patch.object(opread, "terminate_process_group"):
                 with self.assertRaisesRegex(RuntimeError, "failed --version with status 7"):
-                    REAL_RESOLVE_OP()
-            with mock.patch.dict(opread.os.environ, {"PATH": directory}, clear=False), \
-                 mock.patch.object(opread.subprocess, "run", side_effect=opread.subprocess.TimeoutExpired([str(executable), "--version"], 3)):
+                    REAL_RESOLVE_OP({"PATH": directory})
+            hung = Child(None)
+            with mock.patch.object(opread.subprocess, "Popen", return_value=hung), \
+                 mock.patch.object(opread._ReadContext, "collect", side_effect=opread._ProbeTimeout), \
+                 mock.patch.object(opread, "terminate_process_group"):
                 with self.assertRaisesRegex(RuntimeError, "timed out running --version"):
-                    REAL_RESOLVE_OP()
+                    REAL_RESOLVE_OP({"PATH": directory})
+            self.assertTrue(hung.stdout.closed)
 
     def test_normal_failure_happens_before_temp_or_gui_child(self):
         self.op_resolver.stop()
@@ -235,7 +239,7 @@ class OpreadTests(unittest.TestCase):
                  mock.patch.object(opread.subprocess, "Popen", return_value=child) as popen, \
                  mock.patch.object(opread, "terminate_process_group") as cleanup:
                 self.assertEqual(opread.main(), 7)
-            cleanup.assert_called_once_with(child)
+            cleanup.assert_called_once_with(child, deadline=mock.ANY)
             argv = popen.call_args.args[0]
             self.assertEqual(argv[-4:], ["--gui-child", "op://vault/item", "item: Finance approval", "/validated/bin/op"])
             self.assertEqual(popen.call_args.kwargs["env"]["OP_BIOMETRIC_UNLOCK_ENABLED"], "true")
@@ -416,7 +420,7 @@ class OpreadTests(unittest.TestCase):
                  mock.patch.object(opread.subprocess, "Popen", side_effect=publish_then_signal), \
                  mock.patch.object(opread, "terminate_process_group") as cleanup:
                 self.assertEqual(opread.main(), 143)
-            cleanup.assert_called_once_with(child)
+            cleanup.assert_called_once_with(child, deadline=mock.ANY)
             self.assertFalse(os.path.exists(path))
 
     @unittest.skipUnless(os.name == "posix" and Path("/proc").exists(), "requires Linux process groups")
@@ -470,7 +474,7 @@ class OpreadTests(unittest.TestCase):
         import subprocess
         for size in (1, 200000):
             code = ("import sys; from lib import opread; "
-                    f"opread._cli_read=lambda *a: b'x'*{size}; "
+                    f"opread._cli_read=lambda *a,**k: b'x'*{size}; "
                     "sys.argv=['opread','op://vault/item']; "
                     "raise SystemExit(opread.main())")
             with self.subTest(size=size):
@@ -500,7 +504,7 @@ class OpreadTests(unittest.TestCase):
                        "real=subprocess.Popen; "
                        f"code={child_code!r}; "
                        "spawn=lambda *a,**k: real([sys.executable,'-c',code],stdout=subprocess.PIPE,start_new_session=True); "
-                       "opread.resolve_op=lambda *a: ('/fake/op','1'); "
+                       "opread.resolve_op=lambda *a,**k: ('/fake/op','1'); "
                        "p=mock.patch.object(opread.subprocess,'Popen',side_effect=spawn); p.start(); "
                        "\ntry:\n data=opread.read('op://vault/item'); sys.stdout.buffer.write(data)\n"
                        "except opread.OpreadError as e:\n sys.exit(e.returncode)\n")
@@ -529,7 +533,7 @@ class OpreadTests(unittest.TestCase):
                            "real=subprocess.Popen; "
                            f"code={leader!r}; path={str(leaderfile)!r}; "
                            "\ndef spawn(*a,**k):\n p=real([sys.executable,'-c',code],stdout=subprocess.PIPE,start_new_session=True); open(path,'w').write(str(p.pid)); return p\n"
-                           "opread.resolve_op=lambda *a: ('/fake/op','1')\n"
+                           "opread.resolve_op=lambda *a,**k: ('/fake/op','1')\n"
                            "with mock.patch.object(opread.subprocess,'Popen',side_effect=spawn):\n"
                            " try: sys.stdout.buffer.write(opread.read('op://vault/item'))\n"
                            " except opread.OpreadError as e: sys.exit(e.returncode)\n")
@@ -598,7 +602,7 @@ class OpreadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             executable = self.make_fake_op(directory)
             with mock.patch.dict(os.environ, {"PATH": "/nonexistent", "OP_CONNECT_TOKEN": "ignored"}), \
-                 mock.patch.object(opread.subprocess, "run", wraps=opread.subprocess.run) as run:
+                 mock.patch.object(opread.subprocess, "Popen", wraps=opread.subprocess.Popen) as run:
                 self.assertEqual(REAL_RESOLVE_OP({"PATH": directory, "OP_ACCOUNT": "isolated"})[0], str(executable))
             for call in run.call_args_list:
                 self.assertEqual(call.kwargs["env"]["OP_ACCOUNT"], "isolated")
@@ -623,7 +627,7 @@ class OpreadTests(unittest.TestCase):
                             (opread.signal.SIGHUP, 129)):
             before = {s: opread.signal.getsignal(s) for s in
                       (opread.signal.SIGINT, opread.signal.SIGTERM, opread.signal.SIGHUP)}
-            def interrupt(*args):
+            def interrupt(*args, **kwargs):
                 os.kill(os.getpid(), sig)
                 return ("/validated/bin/op", "1")
             with self.subTest(sig=sig), mock.patch.object(opread, "resolve_op", side_effect=interrupt):
@@ -648,6 +652,440 @@ class OpreadTests(unittest.TestCase):
              contextlib.redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(opread.main(), 2)
         self.assertNotIn("secret-token", errors.getvalue())
+
+    def fake_payload(self, payload, status=0):
+        child = Child(status)
+        child.communicate = mock.Mock(return_value=(payload, b"secret diagnostic"))
+        child.stderr = io.BytesIO()
+        return child
+
+    def test_whole_item_parses_once_returns_same_dict_and_preserves_selection_and_label(self):
+        data = b' {"id":"abc","fields":[{"value":"secret"}]}\n\n'
+        child = self.fake_payload(data)
+        env = {"OP_ACCOUNT": "ambient-account", "PATH": "/fake"}
+        parsed = []
+        real_loads = opread.json.loads
+        def parse(*args, **kwargs):
+            value = real_loads(*args, **kwargs)
+            parsed.append(value)
+            return value
+        with mock.patch.object(opread.subprocess, "Popen", return_value=child) as spawn, \
+             mock.patch.object(opread, "terminate_process_group"), \
+             mock.patch.object(opread.json, "loads", side_effect=parse) as loads:
+            result = opread.get_item("item name", "backup", vault="private-vault",
+                                     account="chosen-account", env=env)
+        loads.assert_called_once_with(data.decode("utf-8"), parse_constant=mock.ANY)
+        self.assertIs(result, parsed[0])
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result, {"id": "abc", "fields": [{"value": "secret"}]})
+        args = spawn.call_args.args[0]
+        self.assertEqual(args[2:], ["--gui-item-child", "item name", "WHOLE ITEM: item name: backup",
+                                    "/validated/bin/op", "private-vault", "chosen-account"])
+        self.assertTrue(os.path.basename(args[0]).startswith("WHOLE_ITEM_"))
+        self.assertNotIn("private-vault", args[4])
+        self.assertNotIn("chosen-account", args[4])
+        self.assertEqual(spawn.call_args.kwargs["stderr"], opread.subprocess.PIPE)
+        self.assertEqual(spawn.call_args.kwargs["env"]["OP_ACCOUNT"], "chosen-account")
+        self.assertEqual(env["OP_ACCOUNT"], "ambient-account")
+        self.assertTrue(child.stderr.closed)
+
+    def test_whole_item_gui_uses_fixed_command_and_optional_account(self):
+        for account in (None, "chosen"):
+            with self.subTest(account=account), self.fake_gui() as gui:
+                gui.gtk.main.side_effect = lambda: gui.timers[1][1]()
+                opread.gui("item name", "WHOLE ITEM: item name", "/op", vault="vault", account=account)
+                expected = ["/op", "item", "get", "item name", "--vault", "vault", "--format", "json"]
+                if account is not None:
+                    expected += ["--account", account]
+                gui.popen.assert_called_once_with(expected)
+
+    def test_whole_item_rejects_unsafe_selectors_before_probe(self):
+        for value in (None, "", "--format=json", "line\nbreak", "x\0y", "x\x85y", "é" * 2049):
+            for field in ("item", "vault", "account"):
+                if field == "account" and value is None:
+                    continue
+                values = dict(item="item", vault="vault", account="account")
+                values[field] = value
+                with self.subTest(field=field, value=str(value)[:30]), \
+                     mock.patch.object(opread, "resolve_op") as resolve, \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(opread.OpreadError) as error:
+                        opread.get_item(**values)
+                    self.assertEqual(error.exception.returncode, 2)
+                    resolve.assert_not_called()
+
+    def test_whole_item_strict_json_and_all_failures_sanitized(self):
+        invalid = (b"secret", b"\xffsecret", b'["secret"]', b'"secret"', b"null",
+                   b'{"secret":NaN}', b'{"secret":Infinity}', b'{"secret":-Infinity}',
+                   b'{"secret":1} trailing', b'\xef\xbb\xbf{"secret":1}', b"")
+        for payload, status in [(data, 0) for data in invalid] + [(b'{"secret":1}', 7)]:
+            child = self.fake_payload(payload, status)
+            with self.subTest(payload=payload), \
+                 mock.patch.object(opread.subprocess, "Popen", return_value=child), \
+                 mock.patch.object(opread, "terminate_process_group"), \
+                 contextlib.redirect_stderr(io.StringIO()) as errors:
+                with self.assertRaises(opread.OpreadError) as error:
+                    opread.get_item("item", vault="vault")
+            self.assertEqual(error.exception.returncode, status or 69)
+            self.assertNotIn("secret", str(error.exception))
+            self.assertNotIn("secret", errors.getvalue())
+            self.assertIsNone(error.exception.__cause__)
+            self.assertIsNone(error.exception.__context__)
+        for operation in ("resolve_op", "select_python_runtime"):
+            with self.subTest(operation=operation), \
+                 mock.patch.object(opread, operation, side_effect=RuntimeError("secret")), \
+                 contextlib.redirect_stderr(io.StringIO()) as errors:
+                with self.assertRaises(opread.OpreadError) as error:
+                    opread.get_item("item", vault="vault")
+            self.assertEqual(error.exception.returncode, 69)
+            self.assertNotIn("secret", errors.getvalue())
+        for exception in (OSError("secret"), ValueError("secret"),
+                          opread.subprocess.SubprocessError("secret")):
+            with mock.patch.object(opread.subprocess, "Popen", side_effect=exception), \
+                 contextlib.redirect_stderr(io.StringIO()) as errors:
+                with self.assertRaises(opread.OpreadError) as error:
+                    opread.get_item("item", vault="vault")
+            self.assertEqual(error.exception.returncode, 69)
+            self.assertNotIn("secret", errors.getvalue())
+
+    def test_timeout_validation_and_immediate_control_before_acquisition(self):
+        import threading
+        for value in (-1, float("nan"), float("inf"), "1", True):
+            with self.subTest(timeout=value), self.assertRaises(ValueError):
+                opread.read("op://vault/item", timeout=value)
+        cancelled = threading.Event()
+        cancelled.set()
+        for kwargs, kind, status in (({"timeout": 0}, opread.OpreadTimeoutError, 124),
+                                     ({"cancel": cancelled}, opread.OpreadCancelledError, 130),
+                                     ({"timeout": 0, "cancel": cancelled}, opread.OpreadCancelledError, 130)):
+            with self.subTest(kwargs=kwargs), mock.patch.object(opread, "resolve_op") as resolve:
+                with self.assertRaises(kind) as error:
+                    opread.read("op://vault/item", **kwargs)
+                self.assertEqual(error.exception.returncode, status)
+                resolve.assert_not_called()
+
+    def test_cancel_and_deadline_cover_setup_and_publication_races(self):
+        import threading
+        for phase in ("resolve", "mkdtemp", "copy", "spawn"):
+            for timed in (False, True):
+                cancel = threading.Event()
+                clock = [10.0]
+                paths = []
+                child = Child(0)
+                real_mkdtemp, real_copy = opread.tempfile.mkdtemp, opread.shutil.copyfile
+                def trigger():
+                    if timed:
+                        clock[0] = 12.0
+                    else:
+                        cancel.set()
+                def resolve(*a, **k):
+                    if phase == "resolve": trigger()
+                    return ("/fake/op", "1")
+                def make(**k):
+                    result = real_mkdtemp(**k)
+                    paths.append(result)
+                    if phase == "mkdtemp": trigger()
+                    return result
+                def copy(*a):
+                    result = real_copy(*a)
+                    if phase == "copy": trigger()
+                    return result
+                def spawn(*a, **k):
+                    trigger()
+                    return child
+                with self.subTest(phase=phase, timed=timed), \
+                     mock.patch.object(opread.time, "monotonic", side_effect=lambda: clock[0]), \
+                     mock.patch.object(opread, "resolve_op", side_effect=resolve), \
+                     mock.patch.object(opread.tempfile, "mkdtemp", side_effect=make), \
+                     mock.patch.object(opread.shutil, "copyfile", side_effect=copy), \
+                     mock.patch.object(opread.subprocess, "Popen", side_effect=spawn) as popen, \
+                     mock.patch.object(opread, "terminate_process_group") as cleanup:
+                    kind = opread.OpreadTimeoutError if timed else opread.OpreadCancelledError
+                    with self.assertRaises(kind):
+                        opread.read("op://vault/item", timeout=1 if timed else None, cancel=cancel)
+                self.assertTrue(all(not os.path.exists(path) for path in paths))
+                if phase == "spawn":
+                    cleanup.assert_called_once_with(child, deadline=mock.ANY)
+                    self.assertTrue(child.stdout.closed)
+                else:
+                    popen.assert_not_called()
+
+    def test_control_rechecked_after_item_parsing_and_cleanup(self):
+        import threading
+        for phase in ("parse", "cleanup"):
+            for timed in (False, True):
+                event = threading.Event()
+                clock = [20.0]
+                child = self.fake_payload(b'{"id":"item"}')
+                def trigger(*a, **k):
+                    if timed: clock[0] = 22.0
+                    else: event.set()
+                with self.subTest(phase=phase, timed=timed), \
+                     mock.patch.object(opread.time, "monotonic", side_effect=lambda: clock[0]), \
+                     mock.patch.object(opread.subprocess, "Popen", return_value=child), \
+                     mock.patch.object(opread, "terminate_process_group", side_effect=trigger if phase == "cleanup" else None), \
+                     mock.patch.object(opread, "_parse_item_json", side_effect=trigger if phase == "parse" else None):
+                    kind = opread.OpreadTimeoutError if timed else opread.OpreadCancelledError
+                    with self.assertRaises(kind):
+                        opread.get_item("item", vault="vault", timeout=1 if timed else None, cancel=event)
+
+    def test_cli_signal_during_failed_child_cleanup_overrides_failure(self):
+        signals = (opread.signal.SIGINT, opread.signal.SIGTERM, opread.signal.SIGHUP)
+        for sig, status in zip(signals, (130, 143, 129)):
+            before = {value: opread.signal.getsignal(value) for value in signals}
+            def interrupt(*args, **kwargs):
+                os.kill(os.getpid(), sig)
+            child = self.fake_payload(b"failed credential", 7)
+            with self.subTest(signal=sig), \
+                 mock.patch.object(opread.sys, "argv", ["opread", "op://vault/item"]), \
+                 mock.patch.object(opread.subprocess, "Popen", return_value=child), \
+                 mock.patch.object(opread, "terminate_process_group", side_effect=interrupt), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(opread.main(), status)
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(before, {value: opread.signal.getsignal(value) for value in signals})
+
+    def test_original_failure_preserved_when_cancel_arrives_during_cleanup(self):
+        import threading
+        event = threading.Event()
+        with mock.patch.object(opread.subprocess, "Popen", return_value=self.fake_payload(b"secret", 7)), \
+             mock.patch.object(opread, "terminate_process_group", side_effect=lambda *a, **k: event.set()):
+            with self.assertRaises(opread.OpreadError) as error:
+                opread.get_item("item", vault="vault", cancel=event)
+        self.assertEqual(error.exception.returncode, 7)
+
+    def test_shared_cleanup_allowance_and_close_abandoned_pipes(self):
+        clock = [0.0]
+        context = opread._ReadContext()
+        children = [self.fake_payload(b"secret") for _ in range(3)]
+        deadlines = []
+        def cleanup(child, *, deadline):
+            deadlines.append(deadline)
+            clock[0] += min(3.0, max(0, deadline - clock[0]))
+        with mock.patch.object(opread.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(opread, "terminate_process_group", side_effect=cleanup):
+            context.children.extend(children)
+            context.close()
+        self.assertEqual(clock[0], 5.0)
+        self.assertEqual(deadlines, [5.0, 5.0, 5.0])
+        self.assertEqual(context.cleanup_remaining, 0)
+        self.assertTrue(all(child.stdout.closed and child.stderr.closed for child in children))
+
+    def test_field_setup_and_runtime_diagnostics_preserve_existing_text(self):
+        cases = ((opread.tempfile, "mkdtemp", OSError("private setup failure"),
+                  "cannot prepare opread prompt: private setup failure\n"),
+                 (opread.shutil, "copyfile", OSError("private copy failure"),
+                  "cannot prepare opread prompt: private copy failure\n"),
+                 (opread.subprocess, "Popen", OSError("private spawn failure"),
+                  "cannot prepare opread prompt: private spawn failure\n"),
+                 (opread, "select_python_runtime", RuntimeError("private runtime failure"),
+                  "private runtime failure\n"))
+        for owner, operation, exception, expected in cases:
+            for item in (False, True):
+                with self.subTest(operation=operation, item=item), \
+                     mock.patch.object(owner, operation, side_effect=exception), \
+                     contextlib.redirect_stderr(io.StringIO()) as errors:
+                    with self.assertRaises(opread.OpreadError) as error:
+                        if item:
+                            opread.get_item("item", vault="vault")
+                        else:
+                            opread.read("op://vault/item")
+                self.assertEqual(error.exception.returncode, 69)
+                self.assertEqual(errors.getvalue(), "opread: item read failed\n" if item else expected)
+
+    def test_cleanup_exception_is_sanitized_and_cannot_return_payload(self):
+        with mock.patch.object(opread.subprocess, "Popen", return_value=self.fake_payload(b'{"secret":1}')), \
+             mock.patch.object(opread, "terminate_process_group", side_effect=RuntimeError("secret")), \
+             contextlib.redirect_stderr(io.StringIO()) as errors:
+            with self.assertRaises(opread.OpreadError) as error:
+                opread.get_item("item", vault="vault")
+        self.assertEqual(error.exception.returncode, 69)
+        self.assertNotIn("secret", errors.getvalue())
+
+    def run_real_read(self, code, *, item=False, **controls):
+        import subprocess
+        real = subprocess.Popen
+        def spawn(args, **kwargs):
+            return real([sys.executable, "-S", "-c", code], **kwargs)
+        with mock.patch.object(opread.subprocess, "Popen", side_effect=spawn):
+            if item:
+                return opread.get_item("item", vault="vault", **controls)
+            return opread.read("op://vault/item", **controls)
+
+    def test_real_item_stderr_saturation_drains_and_is_suppressed(self):
+        for status in (0, 7):
+            code = ("import os; "
+                    "[(os.write(2,b'secret'*20000),os.write(1,b' ')) for _ in range(10)]; "
+                    "os.write(1,b'{\"id\":\"value\"}'); "
+                    f"raise SystemExit({status})")
+            with self.subTest(status=status), contextlib.redirect_stderr(io.StringIO()) as errors:
+                if status:
+                    with self.assertRaises(opread.OpreadError) as error:
+                        self.run_real_read(code, item=True, timeout=3)
+                    self.assertEqual(error.exception.returncode, 7)
+                else:
+                    self.assertEqual(self.run_real_read(code, item=True, timeout=3), {"id": "value"})
+            self.assertEqual(errors.getvalue(), "")
+
+    def test_real_running_read_timeout_and_cancel_suppress_partial_payload(self):
+        import threading
+        for timed in (False, True):
+            event = threading.Event()
+            timer = None
+            if not timed:
+                timer = threading.Timer(.15, event.set)
+                timer.start()
+            started = time.monotonic()
+            try:
+                kind = opread.OpreadTimeoutError if timed else opread.OpreadCancelledError
+                with self.assertRaises(kind):
+                    self.run_real_read("import os,time,signal; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+                                       "os.write(1,b'partial secret'); time.sleep(30)",
+                                       timeout=.15 if timed else None, cancel=event)
+                self.assertLess(time.monotonic() - started, 2)
+            finally:
+                if timer: timer.join()
+
+    def test_real_probes_cancel_timeout_and_publication_cleanup(self):
+        import threading
+        import subprocess
+        self.op_resolver.stop()
+        self.addCleanup(self.op_resolver.start)
+        for timed in (False, True):
+            for option in ("--version", "--help"):
+                with self.subTest(timed=timed, option=option), tempfile.TemporaryDirectory() as directory:
+                    fake = Path(directory) / "op"
+                    fake.write_text(f"#!{sys.executable} -S\nimport sys,time,signal\n"
+                                    "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+                                    f"if sys.argv[1]=={option!r}: time.sleep(30)\n"
+                                    "print('2.41.1' if sys.argv[1]=='--version' else '1Password CLI brings 1Password to your terminal.')\n")
+                    fake.chmod(0o700)
+                    event = threading.Event()
+                    timer = threading.Timer(.25, event.set)
+                    if not timed: timer.start()
+                    children = []
+                    real = subprocess.Popen
+                    def spawn(*args, **kwargs):
+                        child = real(*args, **kwargs)
+                        children.append(child)
+                        return child
+                    try:
+                        started = time.monotonic()
+                        with mock.patch.object(opread.subprocess, "Popen", side_effect=spawn):
+                            kind = opread.OpreadTimeoutError if timed else opread.OpreadCancelledError
+                            with self.assertRaises(kind):
+                                opread.read("op://vault/item", env={"PATH": directory},
+                                            timeout=.25 if timed else None, cancel=event)
+                        self.assertLess(time.monotonic() - started, 2)
+                        self.assertEqual(len(children), 1 if option == "--version" else 2)
+                        self.assertTrue(all(child.poll() is not None for child in children))
+                        self.assertTrue(all(child.stdout.closed and child.stderr.closed for child in children))
+                    finally:
+                        if not timed: timer.join()
+
+    def test_probe_budget_is_three_seconds_and_capped_by_total_deadline(self):
+        for total, expected in ((None, 3.0), (1.0, 1.0)):
+            clock = [0.0]
+            context = opread._ReadContext(timeout=total)
+            context.deadline = None if total is None else total
+            child = Child(None)
+            def communicate(timeout):
+                clock[0] += timeout
+                raise opread.subprocess.TimeoutExpired("probe", timeout)
+            child.communicate = communicate
+            with mock.patch.object(opread.time, "monotonic", side_effect=lambda: clock[0]):
+                with self.assertRaises(opread._ProbeTimeout if total is None else opread.OpreadTimeoutError):
+                    context.collect(child, 3.0)
+            self.assertAlmostEqual(clock[0], expected)
+
+    def test_threaded_cancel_isolation_for_whole_items(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import subprocess
+        import threading
+        first, second = threading.Event(), threading.Event()
+        first.set()
+        real = subprocess.Popen
+        environments = [{"OP_ACCOUNT": name} for name in ("one", "two")]
+        original = dict(os.environ)
+        def spawn(args, **kwargs):
+            return real([sys.executable, "-c", "import os,json; print(json.dumps({'account':os.environ['OP_ACCOUNT']}))"], **kwargs)
+        def worker(pair):
+            env, event = pair
+            try:
+                return opread.get_item("item", vault="vault", env=env, cancel=event)
+            except opread.OpreadError as error:
+                return error.returncode
+        with mock.patch.object(opread.subprocess, "Popen", side_effect=spawn), \
+             mock.patch.object(opread.signal, "signal", side_effect=AssertionError("global handler mutation")):
+            with ThreadPoolExecutor(2) as pool:
+                results = list(pool.map(worker, zip(environments, (first, second))))
+        self.assertEqual(results, [130, {"account": "two"}])
+        self.assertEqual(environments, [{"OP_ACCOUNT": "one"}, {"OP_ACCOUNT": "two"}])
+        self.assertEqual(dict(os.environ), original)
+
+
+    def test_probe_spawn_publication_cancellation_reaps_acquired_process(self):
+        import subprocess
+        import threading
+        self.op_resolver.stop()
+        self.addCleanup(self.op_resolver.start)
+        with tempfile.TemporaryDirectory() as directory:
+            self.make_fake_op(directory)
+            event = threading.Event()
+            children = []
+            real = subprocess.Popen
+            def spawn(*args, **kwargs):
+                child = real(*args, **kwargs)
+                children.append(child)
+                event.set()
+                return child
+            with mock.patch.object(opread.subprocess, "Popen", side_effect=spawn):
+                with self.assertRaises(opread.OpreadCancelledError):
+                    opread.read("op://vault/item", env={"PATH": directory}, cancel=event)
+            self.assertEqual(len(children), 1)
+            self.assertIsNotNone(children[0].poll())
+            self.assertTrue(children[0].stdout.closed and children[0].stderr.closed)
+
+    def test_real_cancel_kills_ready_term_resistant_descendant(self):
+        import threading
+        with tempfile.TemporaryDirectory() as directory:
+            pidfile = Path(directory) / "ready"
+            descendant = ("import os,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+                          f"open({str(pidfile)!r},'w').write(str(os.getpid())); time.sleep(30)")
+            leader = ("import subprocess,sys,time,signal; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+                      f"subprocess.Popen([sys.executable,'-S','-c',{descendant!r}]); time.sleep(30)")
+            event, finished = threading.Event(), threading.Event()
+            def cancel_when_ready():
+                deadline = time.monotonic() + 3
+                while not finished.wait(.01) and time.monotonic() < deadline:
+                    if pidfile.exists():
+                        event.set()
+                        return
+                event.set()
+            watcher = threading.Thread(target=cancel_when_ready)
+            watcher.start()
+            try:
+                with self.assertRaises(opread.OpreadCancelledError):
+                    self.run_real_read(leader, cancel=event)
+                self.assertTrue(pidfile.exists(), "descendant never published readiness")
+                pid = int(pidfile.read_text())
+                deadline = time.monotonic() + 1
+                while time.monotonic() < deadline:
+                    try:
+                        state = Path(f"/proc/{pid}/stat").read_text().split()[2]
+                    except FileNotFoundError:
+                        break
+                    if state in ("Z", "X"):
+                        break
+                    time.sleep(.01)
+                else:
+                    self.fail("ready TERM-resistant descendant survived cleanup")
+            finally:
+                finished.set()
+                watcher.join()
+                if pidfile.exists():
+                    try: os.kill(int(pidfile.read_text()), opread.signal.SIGKILL)
+                    except ProcessLookupError: pass
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Private GTK prompt that gives an op read request a visible reason label."""
 
+import json
+import math
 import os
 import re
 import shutil
@@ -8,6 +10,8 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
+import unicodedata
 
 # This distinctive CLI help-banner text identifies the PATH-selected command because --version alone does not identify its vendor; it is a sanity check, not cryptographic proof, and can be spoofed.
 OP_IDENTITY = "1password cli brings 1password to your terminal."
@@ -58,59 +62,68 @@ def check_runtime():
     return 0
 
 
-def resolve_op(env=None):
-    """Find and identify the PATH-selected 1Password CLI without authenticating."""
+def resolve_op(env=None, *, _context=None):
+    """Find and identify the PATH-selected CLI using managed, bounded probes."""
     env = dict(os.environ if env is None else env)
-    candidate = shutil.which("op", path=env.get("PATH", os.defpath))
-    if candidate is None:
-        raise RuntimeError(
-            "cannot find executable 'op' on PATH; install 1Password CLI and check PATH"
-        )
-    path = os.path.realpath(candidate)
-    if not os.path.isfile(path) or not os.access(path, os.X_OK):
-        raise RuntimeError("PATH-selected 'op' is not an executable file: " + path)
-    env["NO_COLOR"] = "1"
-    env["OP_COLOR"] = "never"
-    outputs = []
-    for option in ("--version", "--help"):
-        try:
-            result = subprocess.run(
-                [path, option],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=3,
-                check=False,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
+    context = _context if _context is not None else _ReadContext()
+    try:
+        context.check()
+        candidate = shutil.which("op", path=env.get("PATH", os.defpath))
+        if candidate is None:
             raise RuntimeError(
-                "PATH-selected 'op' timed out running " + option + ": " + path
+                "cannot find executable 'op' on PATH; install 1Password CLI and check PATH"
             )
-        except OSError as exc:
+        path = os.path.realpath(candidate)
+        if not os.path.isfile(path) or not os.access(path, os.X_OK):
+            raise RuntimeError("PATH-selected 'op' is not an executable file: " + path)
+        env["NO_COLOR"] = "1"
+        env["OP_COLOR"] = "never"
+        outputs = []
+        for option in ("--version", "--help"):
+            probe = None
+            try:
+                context.check()
+                probe_deadline = time.monotonic() + 3
+                probe = context.spawn(
+                    [path, option], stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                    start_new_session=True,
+                )
+                output = context.collect(probe, probe_deadline)
+            except _ProbeTimeout:
+                raise RuntimeError(
+                    "PATH-selected 'op' timed out running " + option + ": " + path
+                ) from None
+            except OSError as exc:
+                raise RuntimeError(
+                    "cannot run PATH-selected 'op' " + option + ": " + str(exc)
+                ) from None
+            finally:
+                if probe is not None:
+                    drained = context.cleanup(probe)
+            if output is None:
+                output = drained
+            if probe.returncode != 0:
+                raise RuntimeError(
+                    "PATH-selected 'op' failed " + option + " with status "
+                    + str(probe.returncode) + ": " + path
+                )
+            if output is None:
+                raise RuntimeError("cannot collect PATH-selected 'op' " + option)
+            context.check()
+            outputs.append((output[0] + b"\n" + output[1]).decode("utf-8", errors="replace"))
+        match = re.search(r"(?m)^\s*(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\s*$", outputs[0])
+        if not match:
+            raise RuntimeError("PATH-selected 'op' did not report a valid version: " + path)
+        if OP_IDENTITY not in outputs[1].lower():
             raise RuntimeError(
-                "cannot run PATH-selected 'op' " + option + ": " + str(exc)
+                "PATH-selected 'op' is not identified as 1Password CLI by its help output: " + path
             )
-        if result.returncode != 0:
-            raise RuntimeError(
-                "PATH-selected 'op' failed "
-                + option
-                + " with status "
-                + str(result.returncode)
-                + ": "
-                + path
-            )
-        outputs.append((result.stdout or "") + "\n" + (result.stderr or ""))
-    match = re.search(r"(?m)^\s*(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\s*$", outputs[0])
-    if not match:
-        raise RuntimeError("PATH-selected 'op' did not report a valid version: " + path)
-    if OP_IDENTITY not in outputs[1].lower():
-        raise RuntimeError(
-            "PATH-selected 'op' is not identified as 1Password CLI by its help output: "
-            + path
-        )
-    return path, match.group(1)
+        context.check()
+        return path, match.group(1)
+    finally:
+        if _context is None:
+            context.close()
 
 
 def clean_reason(value):
@@ -147,7 +160,7 @@ def desktop_identity(label):
     return "request" if safe in ("", ".", "..") else safe
 
 
-def gui(reference, label, op_path):
+def gui(reference, label, op_path, *, vault=None, account=None):
     try:
         import gi
 
@@ -208,7 +221,12 @@ def gui(reference, label, op_path):
         if state["proc"] is not None:
             return GLib.SOURCE_REMOVE
         try:
-            state["proc"] = subprocess.Popen([op_path, "read", reference])
+            command = [op_path, "read", reference]
+            if vault is not None:
+                command = [op_path, "item", "get", reference, "--vault", vault, "--format", "json"]
+                if account is not None:
+                    command += ["--account", account]
+            state["proc"] = subprocess.Popen(command)
         except OSError as exc:
             print("cannot start op: " + str(exc), file=sys.stderr)
             state["status"] = 127
@@ -267,25 +285,21 @@ def gui(reference, label, op_path):
     return state["status"]
 
 
-def terminate_process_group(child):
-    """Stop the detached GUI group and reap its interpreter process."""
-    try:
-        os.killpg(child.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        child.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        pass
-    # The leader may already be gone while an op descendant ignores SIGTERM.
-    try:
-        os.killpg(child.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    try:
-        child.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        pass
+def terminate_process_group(child, *, deadline=None):
+    """Stop a detached group, including descendants of an exited leader."""
+    if deadline is None:
+        deadline = time.monotonic() + 5
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(child.pid, sig)
+        except OSError:
+            pass
+        remaining = max(0, deadline - time.monotonic())
+        if remaining:
+            try:
+                child.wait(timeout=min(0.2, remaining))
+            except (subprocess.TimeoutExpired, OSError):
+                pass
 
 
 class OpreadError(Exception):
@@ -294,6 +308,106 @@ class OpreadError(Exception):
     def __init__(self, returncode):
         self.returncode = returncode
         super().__init__("opread failed with status " + str(returncode))
+
+
+class OpreadTimeoutError(OpreadError):
+    """The call's total timeout expired."""
+
+    def __init__(self):
+        super().__init__(124)
+
+
+class OpreadCancelledError(OpreadError):
+    """The caller requested cooperative cancellation."""
+
+    def __init__(self):
+        super().__init__(130)
+
+
+class _ProbeTimeout(Exception):
+    pass
+
+
+class _ReadContext:
+    """Per-call control and ownership; no process-global environment or handlers."""
+
+    def __init__(self, timeout=None, cancel=None, pending=None):
+        started = time.monotonic()
+        if timeout is not None:
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+                raise ValueError("timeout must be a finite nonnegative number of seconds")
+            if not math.isfinite(timeout) or timeout < 0:
+                raise ValueError("timeout must be a finite nonnegative number of seconds")
+        self.deadline = None if timeout is None else started + timeout
+        self.cancel = cancel
+        self.pending = pending
+        self.children = []
+        self.cleanup_remaining = 5.0
+        self.cleanup_failed = False
+
+    def check(self):
+        if self.pending is not None and self.pending["signal"] is not None:
+            raise OpreadError(128 + self.pending["signal"])
+        if self.cancel is not None and self.cancel.is_set():
+            raise OpreadCancelledError()
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise OpreadTimeoutError()
+
+    def spawn(self, *args, **kwargs):
+        self.check()
+        child = subprocess.Popen(*args, **kwargs)
+        # Publish ownership before observing cancellation acquired during Popen.
+        self.children.append(child)
+        self.check()
+        return child
+
+    def collect(self, child, probe_deadline=None):
+        while True:
+            self.check()
+            now = time.monotonic()
+            if probe_deadline is not None and now >= probe_deadline:
+                raise _ProbeTimeout()
+            interval = 0.05
+            for deadline in (self.deadline, probe_deadline):
+                if deadline is not None:
+                    interval = min(interval, max(0, deadline - now))
+            try:
+                return child.communicate(timeout=interval)
+            except subprocess.TimeoutExpired:
+                # EOF can lag leader exit indefinitely (including escaped holders).
+                # Hand ownership to bounded cleanup rather than waiting for EOF.
+                if child.poll() is not None:
+                    return None
+
+    def cleanup(self, child):
+        started = time.monotonic()
+        deadline = started + self.cleanup_remaining
+        output = None
+        try:
+            terminate_process_group(child, deadline=deadline)
+            remaining = max(0, deadline - time.monotonic())
+            if remaining:
+                try:
+                    output = child.communicate(timeout=min(0.5, remaining))
+                except (subprocess.TimeoutExpired, OSError, ValueError):
+                    pass
+        except Exception:
+            self.cleanup_failed = True
+        finally:
+            for name in ("stdout", "stderr"):
+                stream = getattr(child, name, None)
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        self.cleanup_failed = True
+            self.children.remove(child)
+            self.cleanup_remaining = max(0, self.cleanup_remaining - (time.monotonic() - started))
+        return output
+
+    def close(self):
+        for child in self.children[:]:
+            self.cleanup(child)
 
 
 def neutralize_stdout():
@@ -314,6 +428,13 @@ def main():
     if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help"):
         print("usage: opread REF [REASON]\n\nShow a labeled 1Password CLI read prompt.")
         return 0
+    if len(sys.argv) == 7 and sys.argv[1] == "--gui-item-child":
+        try:
+            return gui(sys.argv[2], sys.argv[3], sys.argv[4],
+                       vault=sys.argv[5], account=sys.argv[6] or None)
+        except Exception:
+            print("opread item prompt failed", file=sys.stderr)
+            return 70
     if len(sys.argv) == 5 and sys.argv[1] == "--gui-child":
         try:
             return gui(sys.argv[2], sys.argv[3], sys.argv[4])
@@ -346,14 +467,25 @@ def main():
     return 0
 
 
-def read(reference, reason=None, *, env=None):
-    """Return exact credential bytes using a snapshot of the supplied environment."""
+def read(reference, reason=None, *, env=None, timeout=None, cancel=None):
+    """Return exact credential bytes with optional timeout and cooperative cancellation."""
+    context = _ReadContext(timeout, cancel)
     snapshot = dict(os.environ if env is None else env)
-    return _read(reference, reason, snapshot, {"signal": None})
+    return _read(reference, reason, snapshot, context)
+
+
+def get_item(item, reason=None, *, vault, account=None, env=None, timeout=None, cancel=None):
+    """Return a whole item as a parsed dict; suppress item diagnostics."""
+    context = _ReadContext(timeout, cancel)
+    snapshot = dict(os.environ if env is None else env)
+    if account is not None:
+        snapshot["OP_ACCOUNT"] = account
+    return _read(item, reason, snapshot, context, vault=vault, account=account, item_mode=True)
 
 
 def _cli_read(reference, reason=None):
     pending = {"signal": None}
+    context = _ReadContext(pending=pending)
     old_handlers = {}
 
     def interrupted(signum, _frame):
@@ -363,137 +495,146 @@ def _cli_read(reference, reason=None):
     try:
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             old_handlers[sig] = signal.signal(sig, interrupted)
-        return _read(reference, reason, dict(os.environ), pending)
+        return _read(reference, reason, dict(os.environ), context)
     finally:
         for sig, handler in old_handlers.items():
             signal.signal(sig, handler)
 
 
-def _read(reference, reason, env, pending):
-    if reference.startswith("-") or (reason is not None and reason.startswith("-")):
-        print(UNSUPPORTED_ARGUMENTS_ERROR, file=sys.stderr)
-        raise OpreadError(2)
-    try:
-        validate_reference(reference)
-        if reason is not None:
-            clean_reason(reason)
-        label = display_label(reference, reason)
-        identity = desktop_identity(label)
-    except (ValueError, UnicodeError) as exc:
-        print(str(exc), file=sys.stderr)
-        raise OpreadError(2) from None
+def _validate_selector(value, name):
+    if (not isinstance(value, str) or not value or value.startswith("-")
+            or len(value.encode("utf-8")) > 4096
+            or any(unicodedata.category(c) == "Cc" for c in value)):
+        raise ValueError(name + " must be a nonempty, option-safe name or ID (at most 4096 UTF-8 bytes)")
 
-    incompatible = (
-        "OP_SERVICE_ACCOUNT_TOKEN",
-        "OP_CONNECT_HOST",
-        "OP_CONNECT_TOKEN",
-        "OP_SESSION",
-    )
-    manual_session = any(
-        name.startswith("OP_SESSION_")
-        and name != "OP_SESSION_DELEGATION_ENABLED"
-        and value
-        for name, value in env.items()
-    )
-    if (
-        any(env.get(name) for name in incompatible)
-        or manual_session
-        or env.get("OP_BIOMETRIC_UNLOCK_ENABLED", "").lower() == "false"
-    ):
-        print(
-            "opread requires interactive desktop authentication; a non-interactive 1Password backend is configured",
-            file=sys.stderr,
-        )
-        raise OpreadError(2)
 
-    # The compositor derives the prompt identity from the executable basename.
-    # Run a private copy of the system interpreter under that basename.
-    tempdir = None
-    executable = None
-    child = None
-    status = 69
+def _parse_item_json(output):
+    def reject_constant(_value):
+        raise ValueError("invalid JSON constant")
+    value = json.loads(output.decode("utf-8"), parse_constant=reject_constant)
+    if not isinstance(value, dict):
+        raise ValueError("item JSON must be an object")
+    return value
+
+
+def _read(reference, reason, env, context, *, vault=None, account=None, item_mode=False):
+    # get_item must reject a missing/invalid vault, rather than becoming a field read.
+    tempdir = executable = child = None
     output = None
+    failure = None
     try:
-        op_path = None
+        context.check()
         try:
-            op_path, _op_version = resolve_op(env)
-        except RuntimeError as exc:
-            print("opread: " + str(exc), file=sys.stderr)
-        if pending["signal"] is None and op_path is not None:
-            tempdir = tempfile.mkdtemp(prefix="opread-python-")
-            os.chmod(tempdir, 0o700)
-            executable = os.path.join(tempdir, identity)
+            if item_mode:
+                _validate_selector(reference, "ITEM")
+                _validate_selector(vault, "VAULT")
+                if account is not None:
+                    _validate_selector(account, "ACCOUNT")
+            else:
+                if reference.startswith("-") or (reason is not None and reason.startswith("-")):
+                    raise ValueError(UNSUPPORTED_ARGUMENTS_ERROR)
+                validate_reference(reference)
+            if reason is not None:
+                if reason.startswith("-"):
+                    raise ValueError(UNSUPPORTED_ARGUMENTS_ERROR)
+                clean_reason(reason)
+            label = (("WHOLE ITEM: " + reference + (": " + reason if reason is not None else ""))
+                     if item_mode else display_label(reference, reason))
+            identity = desktop_identity(label)
+        except (ValueError, UnicodeError, TypeError, AttributeError) as exc:
+            print("opread: invalid item request" if item_mode else str(exc), file=sys.stderr)
+            raise OpreadError(2) from None
+
+        incompatible = ("OP_SERVICE_ACCOUNT_TOKEN", "OP_CONNECT_HOST", "OP_CONNECT_TOKEN", "OP_SESSION")
+        manual_session = any(
+            name.startswith("OP_SESSION_") and name != "OP_SESSION_DELEGATION_ENABLED" and value
+            for name, value in env.items()
+        )
+        if (any(env.get(name) for name in incompatible) or manual_session
+                or env.get("OP_BIOMETRIC_UNLOCK_ENABLED", "").lower() == "false"):
+            print("opread requires interactive desktop authentication; a non-interactive 1Password backend is configured",
+                  file=sys.stderr)
+            raise OpreadError(2)
+
+        op_path, _op_version = resolve_op(env, _context=context)
+        context.check()
+        tempdir = tempfile.mkdtemp(prefix="opread-python-")
+        context.check()
+        os.chmod(tempdir, 0o700)
+        executable = os.path.join(tempdir, identity)
         try:
             source_python, python_home = select_python_runtime()
         except RuntimeError as exc:
-            source_python = None
-            print(str(exc), file=sys.stderr)
-        if pending["signal"] is None and (source_python is None or op_path is None):
-            pass
-        elif pending["signal"] is None and op_path is not None:
-            shutil.copyfile(source_python, executable)
-            if pending["signal"] is None:
-                os.chmod(executable, 0o700)
-                child_env = {k: v for k, v in env.items() if not k.startswith("PYTHON")}
-                child_env["PYTHONHOME"] = python_home
-                child_env["OP_BIOMETRIC_UNLOCK_ENABLED"] = "true"
-                if pending["signal"] is None:
-                    child = subprocess.Popen(
-                        [
-                            executable,
-                            os.path.abspath(__file__),
-                            "--gui-child",
-                            reference,
-                            label,
-                            op_path,
-                        ],
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE,
-                        start_new_session=True,
-                        env=child_env,
-                    )
-                    while pending["signal"] is None:
-                        try:
-                            output, _ = child.communicate(timeout=0.1)
-                            code = child.returncode
-                            status = code if code >= 0 else 128 - code
-                            break
-                        except subprocess.TimeoutExpired:
-                            code = child.poll()
-                            if code is not None:
-                                status = code if code >= 0 else 128 - code
-                                break
-    except OSError as exc:
-        print("cannot prepare opread prompt: " + str(exc), file=sys.stderr)
-        status = 69
+            print("opread: item read failed" if item_mode else str(exc), file=sys.stderr)
+            raise OpreadError(69) from None
+        context.check()
+        shutil.copyfile(source_python, executable)
+        context.check()
+        os.chmod(executable, 0o700)
+        child_env = {k: v for k, v in env.items() if not k.startswith("PYTHON")}
+        child_env["PYTHONHOME"] = python_home
+        child_env["OP_BIOMETRIC_UNLOCK_ENABLED"] = "true"
+        args = [executable, os.path.abspath(__file__), "--gui-child", reference, label, op_path]
+        kwargs = {}
+        if item_mode:
+            args[2] = "--gui-item-child"
+            args += [vault, account or ""]
+            kwargs["stderr"] = subprocess.PIPE
+        child = context.spawn(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              start_new_session=True, env=child_env, **kwargs)
+        collected = context.collect(child)
+        status = child.returncode
+        status = status if status >= 0 else 128 - status
+        drained = context.cleanup(child)
+        if collected is None:
+            collected = drained
+        if status:
+            raise OpreadError(status)
+        if collected is None:
+            raise RuntimeError("cannot collect complete output")
+        output = collected[0]
+        context.check()
+        if item_mode:
+            output = _parse_item_json(output)
+        context.check()
+    except OpreadError as exc:
+        failure = exc
+    except Exception as exc:
+        # Item payloads and exception text (including JSON decoder excerpts) must
+        # never become diagnostics. Field reads retain their existing diagnostics.
+        if item_mode:
+            diagnostic = "opread: item read failed"
+        elif isinstance(exc, OSError):
+            diagnostic = "cannot prepare opread prompt: " + str(exc)
+        else:
+            diagnostic = "opread: " + str(exc)
+        print(diagnostic, file=sys.stderr)
+        failure = OpreadError(69)
     finally:
-        if child is not None:
-            terminate_process_group(child)
-            if output is None:
+        try:
+            context.close()
+        finally:
+            if executable is not None:
                 try:
-                    output, _ = child.communicate(timeout=1)
-                except (subprocess.TimeoutExpired, OSError):
-                    if status == 0 and pending["signal"] is None:
-                        print("opread: cannot collect complete output", file=sys.stderr)
-                        status = 69
-            if child.stdout is not None:
-                child.stdout.close()
-        if executable is not None:
-            try:
-                os.unlink(executable)
-            except OSError:
-                pass
-        if tempdir is not None:
-            try:
-                os.rmdir(tempdir)
-            except OSError:
-                pass
-    if pending["signal"] is not None:
-        status = {signal.SIGINT: 130, signal.SIGTERM: 143, signal.SIGHUP: 129}[
-            pending["signal"]
-        ]
-    if status:
-        raise OpreadError(status) from None
+                    os.unlink(executable)
+                except OSError:
+                    pass
+            if tempdir is not None:
+                try:
+                    os.rmdir(tempdir)
+                except OSError:
+                    pass
+    if failure is None and context.cleanup_failed:
+        print("opread: cannot finish cleanup", file=sys.stderr)
+        failure = OpreadError(69)
+    # CLI signals retain their historical precedence over child failures.
+    # Library calls have no pending signal state and keep failure-first semantics.
+    if context.pending is not None:
+        context.check()
+    if failure is not None:
+        raise failure from None
+    # Cancellation takes precedence over deadline when both become observable.
+    context.check()
     return output
 
 
