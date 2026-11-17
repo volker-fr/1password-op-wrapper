@@ -16,6 +16,23 @@ make check
 
 The requested labels are `password-item/key` and `password-item/key: provided reason for request`. The vault name is omitted. The reason is supplied explicitly; it is not detected automatically. Prompt appearance can vary by desktop and 1Password version.
 
+## Python usage
+
+With the repository on Python's import path, call from the main thread:
+
+```python
+from lib.opread import OpreadError, read
+
+try:
+    credential = read("op://private/password-item/key", "provided reason for request")
+except OpreadError as error:
+    print(f"Read failed with status {error.returncode}")
+```
+
+`read` returns the exact credential bytes on success and raises `OpreadError` with a `returncode` on failure. Diagnostics go to standard error. It must run on the main thread because it installs signal handlers.
+
+The CLI buffers the complete credential in memory and writes it to standard output only after a successful read; partial output from a failed read is suppressed. Large credentials therefore require corresponding memory. A later output write failure can still leave a partial write.
+
 ## Prompt comparison
 
 Screenshots use made-up references (`op://private/item/key` for `op read` and `op://private/password-item/key` for `opread`); the vault name was replaced with “YourVaultName” and the account icon removed for privacy. Both prompts were dismissed without approval.

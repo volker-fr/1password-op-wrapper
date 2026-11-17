@@ -3,6 +3,7 @@ import importlib.util
 import io
 import os
 import tempfile
+import sys
 import time
 import types
 import unittest
@@ -11,7 +12,7 @@ from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "opread.py"
-spec = importlib.util.spec_from_file_location("opread_under_test", SCRIPT)
+spec = importlib.util.spec_from_file_location("opread_under_test", SCRIPT.parent / "lib" / "opread.py")
 opread = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(opread)
 REAL_RESOLVE_OP = opread.resolve_op
@@ -22,6 +23,11 @@ class Child:
 
     def __init__(self, status):
         self.status = status
+        self.returncode = status
+        self.stdout = io.BytesIO()
+
+    def communicate(self, timeout=None):
+        return b"", None
 
     def wait(self, timeout=None):
         return self.status
@@ -173,6 +179,45 @@ class OpreadTests(unittest.TestCase):
                 resolve_op.assert_not_called()
                 mkdtemp.assert_not_called()
                 popen.assert_not_called()
+
+    def test_read_returns_exact_bytes_and_suppresses_failures(self):
+        for data in (b"", b"newline\n\n", b"nul\0\xff", b"x" * 200000):
+            child = Child(0)
+            child.communicate = mock.Mock(return_value=(data, None))
+            with self.subTest(length=len(data)), \
+                 mock.patch.object(opread.subprocess, "Popen", return_value=child) as popen, \
+                 mock.patch.object(opread, "terminate_process_group"):
+                self.assertEqual(opread.read("op://vault/item", "Finance"), data)
+            self.assertEqual(popen.call_args.kwargs["stdout"], opread.subprocess.PIPE)
+            self.assertNotIn("stderr", popen.call_args.kwargs)
+        child = Child(7)
+        child.communicate = mock.Mock(return_value=(b"secret", None))
+        with mock.patch.object(opread.subprocess, "Popen", return_value=child), \
+             mock.patch.object(opread, "terminate_process_group"), \
+             self.assertRaises(opread.OpreadError) as error:
+            opread.read("op://vault/item")
+        self.assertEqual(error.exception.returncode, 7)
+        self.assertNotIn("secret", str(error.exception))
+        self.assertIsNone(error.exception.__cause__)
+
+    def test_read_rejects_option_like_arguments_before_probe(self):
+        for reference, reason in (("-ref", None), ("op://vault/item", "-reason")):
+            with self.subTest(reference=reference, reason=reason), \
+                 mock.patch.object(opread, "resolve_op") as resolve_op, \
+                 contextlib.redirect_stderr(io.StringIO()) as errors:
+                with self.assertRaises(opread.OpreadError) as error:
+                    opread.read(reference, reason)
+                self.assertEqual(error.exception.returncode, 2)
+                self.assertEqual(errors.getvalue().strip(), opread.UNSUPPORTED_ARGUMENTS_ERROR)
+                resolve_op.assert_not_called()
+
+    def test_root_entry_point_forwards_to_library_main(self):
+        import runpy
+        with mock.patch("lib.opread.main", return_value=7) as main:
+            with self.assertRaises(SystemExit) as result:
+                runpy.run_path(str(SCRIPT), run_name="__main__")
+        self.assertEqual(result.exception.code, 7)
+        main.assert_called_once_with()
 
     def test_child_status_is_forwarded_and_tempdir_removed(self):
         with tempfile.TemporaryDirectory() as parent:
@@ -404,6 +449,113 @@ class OpreadTests(unittest.TestCase):
                 time.sleep(0.02)
             else:
                 self.fail("SIGTERM-resistant descendant survived process-group cleanup")
+
+    def test_cli_output_write_and_flush_failures(self):
+        for where, error, expected in (("write", BrokenPipeError(), 141),
+                                        ("flush", BrokenPipeError(), 141),
+                                        ("write", OSError(), 1), ("flush", OSError(), 1)):
+            stream = mock.Mock()
+            getattr(stream.buffer, where).side_effect = error
+            with self.subTest(where=where, expected=expected), \
+                 mock.patch.object(opread.sys, "argv", ["opread", "op://vault/item"]), \
+                 mock.patch.object(opread.sys, "stdout", stream), \
+                 mock.patch.object(opread, "neutralize_stdout") as neutralize, \
+                 mock.patch.object(opread, "read", return_value=b"data"), \
+                 contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(opread.main(), expected)
+            neutralize.assert_called_once()
+            self.assertEqual(errors.getvalue(), "opread: cannot write output\n" if expected == 1 else "")
+
+    def test_cli_real_broken_pipe_has_no_shutdown_override(self):
+        import subprocess
+        for size in (1, 200000):
+            code = ("import sys; from lib import opread; "
+                    f"opread.read=lambda *a: b'x'*{size}; "
+                    "sys.argv=['opread','op://vault/item']; "
+                    "raise SystemExit(opread.main())")
+            with self.subTest(size=size):
+                proc = subprocess.Popen([sys.executable, "-c", code], cwd=SCRIPT.parent,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                proc.stdout.close()
+                proc.stdout = None
+                try:
+                    _, errors = proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+                    self.fail("broken-pipe fixture exceeded deadline")
+                self.assertEqual(proc.returncode, 141)
+                self.assertNotIn(b"Traceback", errors)
+                self.assertNotIn(b"Exception ignored", errors)
+                proc.stderr.close()
+
+    def test_real_child_drains_phased_output_and_inherits_stderr(self):
+        import subprocess
+        for status in (0, 7):
+            child_code = ("import os,time; "
+                          "os.write(2,b'child diagnostic\\n'); "
+                          "[(os.write(1,bytes([65+i])*100000),time.sleep(.16)) for i in range(3)]; "
+                          f"raise SystemExit({status})")
+            harness = ("import subprocess,sys; from unittest import mock; from lib import opread; "
+                       "real=subprocess.Popen; "
+                       f"code={child_code!r}; "
+                       "spawn=lambda *a,**k: real([sys.executable,'-c',code],stdout=subprocess.PIPE,start_new_session=True); "
+                       "opread.resolve_op=lambda: ('/fake/op','1'); "
+                       "p=mock.patch.object(opread.subprocess,'Popen',side_effect=spawn); p.start(); "
+                       "\ntry:\n data=opread.read('op://vault/item'); sys.stdout.buffer.write(data)\n"
+                       "except opread.OpreadError as e:\n sys.exit(e.returncode)\n")
+            with self.subTest(status=status):
+                result = subprocess.run([sys.executable, "-c", harness], cwd=SCRIPT.parent,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
+                self.assertEqual(result.returncode, status)
+                self.assertEqual(result.stdout, b"" if status else
+                                 b"A" * 100000 + b"B" * 100000 + b"C" * 100000)
+                self.assertEqual(result.stderr, b"child diagnostic\n")
+
+    @unittest.skipUnless(os.name == "posix", "requires process groups")
+    def test_real_pipe_holder_is_cleaned_or_bounded(self):
+        import subprocess
+        for escaped, exitcode in ((False, 0), (True, 0), (True, 7)):
+            with self.subTest(escaped=escaped, exitcode=exitcode), tempfile.TemporaryDirectory() as directory:
+                pidfile = Path(directory) / "holder.pid"
+                leaderfile = Path(directory) / "leader.pid"
+                holder = f"import os,time; open({str(pidfile)!r},'w').write(str(os.getpid())); time.sleep(30)"
+                leader = ("import os,subprocess,sys,time; "
+                          f"p=subprocess.Popen([sys.executable,'-c',{holder!r}], start_new_session={escaped!r}, stderr=subprocess.DEVNULL); "
+                          f"path={str(pidfile)!r}; "
+                          "\nwhile not os.path.exists(path): time.sleep(.01)\n"
+                          f"os.write(1,b'credential'); sys.exit({exitcode})")
+                harness = ("import subprocess,sys; from unittest import mock; from lib import opread; "
+                           "real=subprocess.Popen; "
+                           f"code={leader!r}; path={str(leaderfile)!r}; "
+                           "\ndef spawn(*a,**k):\n p=real([sys.executable,'-c',code],stdout=subprocess.PIPE,start_new_session=True); open(path,'w').write(str(p.pid)); return p\n"
+                           "opread.resolve_op=lambda: ('/fake/op','1')\n"
+                           "with mock.patch.object(opread.subprocess,'Popen',side_effect=spawn):\n"
+                           " try: sys.stdout.buffer.write(opread.read('op://vault/item'))\n"
+                           " except opread.OpreadError as e: sys.exit(e.returncode)\n")
+                proc = subprocess.Popen([sys.executable, "-c", harness], cwd=SCRIPT.parent,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                started = time.monotonic()
+                try:
+                    try:
+                        output, errors = proc.communicate(timeout=6)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        self.fail("pipe-holder fixture exceeded deadline")
+                    self.assertLess(time.monotonic() - started, 6)
+                    self.assertEqual(proc.returncode, 69 if escaped and exitcode == 0 else exitcode)
+                    self.assertEqual(output, b"" if escaped else b"credential")
+                    self.assertEqual(bool(errors), escaped and exitcode == 0)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                    for path, group in ((leaderfile, True), (pidfile, False)):
+                        if path.exists():
+                            try:
+                                (os.killpg if group else os.kill)(int(path.read_text()), opread.signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                    proc.communicate(timeout=2)
 
     def test_backend_conflict_is_reported_without_echoing_value(self):
         with mock.patch.dict(opread.os.environ, {"OP_CONNECT_TOKEN": "secret-token"}, clear=False), \
