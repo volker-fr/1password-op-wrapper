@@ -5,6 +5,7 @@ import os
 import tempfile
 import sys
 import time
+import traceback
 import types
 import unittest
 from pathlib import Path
@@ -16,6 +17,7 @@ spec = importlib.util.spec_from_file_location("opread_under_test", SCRIPT.parent
 opread = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(opread)
 REAL_RESOLVE_OP = opread.resolve_op
+PRIVATE_SENTINEL = "synthetic private diagnostic"
 
 
 class Child:
@@ -193,7 +195,7 @@ class OpreadTests(unittest.TestCase):
                  mock.patch.object(opread, "terminate_process_group"):
                 self.assertEqual(opread.read("op://vault/item", "Finance"), data)
             self.assertEqual(popen.call_args.kwargs["stdout"], opread.subprocess.PIPE)
-            self.assertNotIn("stderr", popen.call_args.kwargs)
+            self.assertEqual(popen.call_args.kwargs["stderr"], opread.subprocess.DEVNULL)
         child = Child(7)
         child.communicate = mock.Mock(return_value=(b"secret", None))
         with mock.patch.object(opread.subprocess, "Popen", return_value=child), \
@@ -212,7 +214,7 @@ class OpreadTests(unittest.TestCase):
                 with self.assertRaises(opread.OpreadError) as error:
                     opread.read(reference, reason)
                 self.assertEqual(error.exception.returncode, 2)
-                self.assertEqual(errors.getvalue().strip(), opread.UNSUPPORTED_ARGUMENTS_ERROR)
+                self.assertEqual(errors.getvalue(), "")
                 resolve_op.assert_not_called()
 
     def test_root_entry_point_forwards_to_library_main(self):
@@ -493,9 +495,9 @@ class OpreadTests(unittest.TestCase):
                 self.assertNotIn(b"Exception ignored", errors)
                 proc.stderr.close()
 
-    def test_real_child_drains_phased_output_and_inherits_stderr(self):
+    def test_real_field_child_drains_output_with_stderr_only_for_cli(self):
         import subprocess
-        for status in (0, 7):
+        for entry, status in (("cli", 0), ("cli", 7), ("library", 0), ("library", 7), ("library", 1)):
             child_code = ("import os,time; "
                           "os.write(2,b'child diagnostic\\n'); "
                           "[(os.write(1,bytes([65+i])*100000),time.sleep(.16)) for i in range(3)]; "
@@ -503,18 +505,19 @@ class OpreadTests(unittest.TestCase):
             harness = ("import subprocess,sys; from unittest import mock; from lib import opread; "
                        "real=subprocess.Popen; "
                        f"code={child_code!r}; "
-                       "spawn=lambda *a,**k: real([sys.executable,'-c',code],stdout=subprocess.PIPE,start_new_session=True); "
+                       "spawn=lambda *a,**k: real([sys.executable,'-c',code],**k); "
                        "opread.resolve_op=lambda *a,**k: ('/fake/op','1'); "
                        "p=mock.patch.object(opread.subprocess,'Popen',side_effect=spawn); p.start(); "
+                       f"\nif {entry == 'cli'!r}:\n sys.argv=['opread','op://vault/item']; sys.exit(opread.main())\n"
                        "\ntry:\n data=opread.read('op://vault/item'); sys.stdout.buffer.write(data)\n"
                        "except opread.OpreadError as e:\n sys.exit(e.returncode)\n")
-            with self.subTest(status=status):
+            with self.subTest(entry=entry, status=status):
                 result = subprocess.run([sys.executable, "-c", harness], cwd=SCRIPT.parent,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
                 self.assertEqual(result.returncode, status)
                 self.assertEqual(result.stdout, b"" if status else
                                  b"A" * 100000 + b"B" * 100000 + b"C" * 100000)
-                self.assertEqual(result.stderr, b"child diagnostic\n")
+                self.assertEqual(result.stderr, b"child diagnostic\n" if entry == "cli" else b"")
 
     @unittest.skipUnless(os.name == "posix", "requires process groups")
     def test_real_pipe_holder_is_cleaned_or_bounded(self):
@@ -549,7 +552,7 @@ class OpreadTests(unittest.TestCase):
                     self.assertLess(time.monotonic() - started, 6)
                     self.assertEqual(proc.returncode, 69 if escaped and exitcode == 0 else exitcode)
                     self.assertEqual(output, b"" if escaped else b"credential")
-                    self.assertEqual(bool(errors), escaped and exitcode == 0)
+                    self.assertEqual(errors, b"")
                 finally:
                     if proc.poll() is None:
                         proc.kill()
@@ -833,13 +836,15 @@ class OpreadTests(unittest.TestCase):
         signals = (opread.signal.SIGINT, opread.signal.SIGTERM, opread.signal.SIGHUP)
         for sig, status in zip(signals, (130, 143, 129)):
             before = {value: opread.signal.getsignal(value) for value in signals}
-            def interrupt(*args, **kwargs):
+            def interrupt_and_fail_close():
                 os.kill(os.getpid(), sig)
+                raise RuntimeError(PRIVATE_SENTINEL)
             child = self.fake_payload(b"failed credential", 7)
             with self.subTest(signal=sig), \
                  mock.patch.object(opread.sys, "argv", ["opread", "op://vault/item"]), \
                  mock.patch.object(opread.subprocess, "Popen", return_value=child), \
-                 mock.patch.object(opread, "terminate_process_group", side_effect=interrupt), \
+                 mock.patch.object(opread, "terminate_process_group"), \
+                 mock.patch.object(opread._ReadContext, "close", side_effect=interrupt_and_fail_close), \
                  contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(opread.main(), status)
             self.assertEqual(output.getvalue(), "")
@@ -881,17 +886,212 @@ class OpreadTests(unittest.TestCase):
                  (opread, "select_python_runtime", RuntimeError("private runtime failure"),
                   "private runtime failure\n"))
         for owner, operation, exception, expected in cases:
-            for item in (False, True):
-                with self.subTest(operation=operation, item=item), \
-                     mock.patch.object(owner, operation, side_effect=exception), \
+            with self.subTest(operation=operation), \
+                 mock.patch.object(owner, operation, side_effect=exception), \
+                 mock.patch.object(opread.sys, "argv", ["opread", "op://vault/item"]), \
+                 contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(opread.main(), 69)
+                self.assertEqual(errors.getvalue(), expected)
+                self.assert_quiet_library_failure(lambda: opread.read("op://vault/item"))
+                self.assert_quiet_library_failure(lambda: opread.get_item("item", vault="vault"))
+
+    def assert_quiet_library_failure(self, invoke, status=69, kind=opread.OpreadError):
+        with contextlib.redirect_stdout(io.StringIO()) as output, \
+             contextlib.redirect_stderr(io.StringIO()) as errors:
+            try:
+                raise RuntimeError(PRIVATE_SENTINEL)
+            except RuntimeError:
+                try:
+                    invoke()
+                except Exception as error:
+                    self.assertIs(type(error), kind)
+                    self.assertIsNone(error.__cause__)
+                    self.assertIsNone(error.__context__)
+                    if kind is ValueError:
+                        self.assertEqual(str(error), "timeout must be a finite nonnegative number of seconds")
+                    else:
+                        self.assertEqual(error.returncode, status)
+                        self.assertEqual(str(error), f"opread failed with status {status}")
+                    rendered = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+                    self.assertNotIn(PRIVATE_SENTINEL, rendered)
+                    frames = traceback.extract_tb(error.__traceback__)
+                    self.assertIn(frames[-2].name, ("read", "get_item"))
+                    self.assertEqual(frames[-1].name, "_library_read")
+                else:
+                    self.fail("library call unexpectedly returned a result")
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_library_failure_boundary_covers_initialization_and_caller_inputs(self):
+        class BrokenEnvironment:
+            def keys(self):
+                raise ValueError(PRIVATE_SENTINEL)
+
+        def field(**kwargs):
+            return opread.read("op://vault/item", **kwargs)
+
+        def item(**kwargs):
+            return opread.get_item("item", vault="vault", account="account", **kwargs)
+
+        for read in (field, item):
+            with self.subTest(read=read.__name__):
+                with mock.patch.object(opread.time, "monotonic", side_effect=OSError(PRIVATE_SENTINEL)):
+                    self.assert_quiet_library_failure(read)
+                self.assert_quiet_library_failure(lambda: read(env=BrokenEnvironment()))
+                self.assert_quiet_library_failure(lambda: read(timeout=-1), kind=ValueError)
+                with mock.patch.object(opread, "resolve_op") as resolve:
+                    for timeout in (10**400, -(10**400)):
+                        self.assert_quiet_library_failure(lambda: read(timeout=timeout), kind=ValueError)
+                    resolve.assert_not_called()
+                self.assert_quiet_library_failure(lambda: read(timeout=0), 124, opread.OpreadTimeoutError)
+                self.assert_quiet_library_failure(
+                    lambda: read(cancel=mock.Mock(is_set=lambda: True)), 130, opread.OpreadCancelledError)
+
+    def test_library_process_control_exceptions_keep_original_tracebacks(self):
+        for error in (KeyboardInterrupt(PRIVATE_SENTINEL), SystemExit(17)):
+            class Cancel:
+                def is_set(self):
+                    raise error
+
+            with self.subTest(kind=type(error)):
+                try:
+                    opread.read("op://vault/item", cancel=Cancel())
+                except (KeyboardInterrupt, SystemExit) as caught:
+                    self.assertIs(caught, error)
+                    self.assertEqual(traceback.extract_tb(caught.__traceback__)[-1].name, "is_set")
+                else:
+                    self.fail("process-control exception did not propagate")
+
+    def test_library_failure_boundary_rebuilds_only_safe_statuses(self):
+        class UntrustedError(opread.OpreadError):
+            @property
+            def returncode(self):
+                self.fail_access()
+
+            def __str__(self):
+                self.fail_access()
+
+        class UntrustedStatus(int):
+            def __str__(self):
+                raise AssertionError("formatted an untrusted status")
+
+        subclass = UntrustedError.__new__(UntrustedError)
+        subclass.fail_access = mock.Mock(side_effect=AssertionError("accessed an untrusted exception"))
+        malformed = (PRIVATE_SENTINEL, UntrustedStatus(7), True, 0, -1, 256, None)
+        failures = [(subclass, 69)]
+        for status in (*malformed, 1, 255):
+            error = opread.OpreadError(7)
+            error.returncode = status
+            error.args = (PRIVATE_SENTINEL,)
+            failures.append((error, status if type(status) is int and 1 <= status <= 255 else 69))
+        for error, expected in failures:
+            cancel = mock.Mock()
+            cancel.is_set.side_effect = error
+            self.assert_quiet_library_failure(lambda: opread.read("op://vault/item", cancel=cancel), expected)
+        subclass.fail_access.assert_not_called()
+
+    def test_library_probe_launch_error_is_never_formatted(self):
+        formatted = mock.Mock(return_value=PRIVATE_SENTINEL)
+
+        class ProbeError(OSError):
+            def __str__(self):
+                return formatted()
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.make_fake_op(directory)
+            env = {"PATH": directory}
+            with mock.patch.object(opread, "resolve_op", REAL_RESOLVE_OP), \
+                 mock.patch.object(opread.subprocess, "Popen", side_effect=ProbeError()), \
+                 mock.patch.dict(opread.os.environ, env, clear=True):
+                self.assert_quiet_library_failure(lambda: opread.read("op://vault/item", env=env))
+                self.assert_quiet_library_failure(lambda: opread.get_item("item", vault="vault", env=env))
+                formatted.assert_not_called()
+                with self.assertRaisesRegex(RuntimeError, PRIVATE_SENTINEL):
+                    opread.resolve_op(env)
+                with mock.patch.object(opread.sys, "argv", ["opread", "op://vault/item"]), \
                      contextlib.redirect_stderr(io.StringIO()) as errors:
-                    with self.assertRaises(opread.OpreadError) as error:
-                        if item:
-                            opread.get_item("item", vault="vault")
-                        else:
+                    self.assertEqual(opread.main(), 69)
+                self.assertEqual(errors.getvalue(),
+                                 f"opread: cannot run PATH-selected 'op' --version: {PRIVATE_SENTINEL}\n")
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(opread.check_runtime(), 1)
+                self.assertEqual(output.getvalue(),
+                                 f"FAIL cannot run PATH-selected 'op' --version: {PRIVATE_SENTINEL}\n")
+                self.assertEqual(formatted.call_count, 3)
+
+    def test_unexpected_close_failure_preserves_primary_status_and_file_cleanup(self):
+        for child_status in (0, 7):
+            with self.subTest(child_status=child_status), \
+                 tempfile.TemporaryDirectory() as directory, \
+                 mock.patch.object(opread.tempfile, "tempdir", directory), \
+                 mock.patch.object(opread.subprocess, "Popen",
+                                   return_value=self.fake_payload(b'{"item":1}', child_status)), \
+                 mock.patch.object(opread, "terminate_process_group"), \
+                 mock.patch.object(opread._ReadContext, "close", side_effect=RuntimeError(PRIVATE_SENTINEL)):
+                self.assert_quiet_library_failure(
+                    lambda: opread.get_item("item", vault="vault"), child_status or 69)
+                self.assertEqual(os.listdir(directory), [])
+
+    def test_unexpected_file_cleanup_failures_preserve_precedence(self):
+        for operation in ("unlink", "rmdir"):
+            for outcome in ("success", "failure", "interrupt", "system_exit", "signal"):
+                interruption = {
+                    "interrupt": KeyboardInterrupt(PRIVATE_SENTINEL),
+                    "system_exit": SystemExit(17),
+                }.get(outcome)
+                child = self.fake_payload(b"synthetic credential", 7 if outcome in ("failure", "signal") else 0)
+
+                def fail_removal(path):
+                    if outcome == "signal":
+                        os.kill(os.getpid(), opread.signal.SIGTERM)
+                    raise RuntimeError(PRIVATE_SENTINEL)
+
+                with self.subTest(operation=operation, outcome=outcome), \
+                     tempfile.TemporaryDirectory() as directory, \
+                     mock.patch.object(opread.tempfile, "tempdir", directory), \
+                     mock.patch.object(opread.subprocess, "Popen", return_value=child), \
+                     mock.patch.object(opread, "terminate_process_group"), \
+                     mock.patch.object(opread.shutil, "copyfile",
+                                       wraps=opread.shutil.copyfile, side_effect=interruption), \
+                     mock.patch.object(opread.os, "unlink", wraps=os.unlink,
+                                       side_effect=fail_removal if operation == "unlink" else None) as unlink, \
+                     mock.patch.object(opread.os, "rmdir", wraps=os.rmdir,
+                                       side_effect=fail_removal if operation == "rmdir" else None) as rmdir:
+                    if outcome == "signal":
+                        with mock.patch.object(opread.sys, "argv", ["opread", "op://vault/item"]), \
+                             contextlib.redirect_stdout(io.StringIO()) as output, \
+                             contextlib.redirect_stderr(io.StringIO()) as errors:
+                            self.assertEqual(opread.main(), 143)
+                        self.assertEqual((output.getvalue(), errors.getvalue()), ("", ""))
+                    elif interruption is not None:
+                        with self.assertRaises(type(interruption)) as caught:
                             opread.read("op://vault/item")
-                self.assertEqual(error.exception.returncode, 69)
-                self.assertEqual(errors.getvalue(), "opread: item read failed\n" if item else expected)
+                        self.assertIs(caught.exception, interruption)
+                    else:
+                        self.assert_quiet_library_failure(lambda: opread.read("op://vault/item"), child.returncode or 69)
+                    unlink.assert_called_once()
+                    rmdir.assert_called_once()
+
+    def test_library_failure_boundary_covers_final_cancellation_check(self):
+        closed = False
+        original_close = opread._ReadContext.close
+
+        def close(context):
+            nonlocal closed
+            original_close(context)
+            closed = True
+
+        def is_set():
+            if closed:
+                raise RuntimeError(PRIVATE_SENTINEL)
+            return False
+
+        with mock.patch.object(opread._ReadContext, "close", close), \
+             mock.patch.object(opread.subprocess, "Popen", return_value=self.fake_payload(b"credential")), \
+             mock.patch.object(opread, "terminate_process_group"):
+            cancel = mock.Mock(is_set=is_set)
+            self.assert_quiet_library_failure(lambda: opread.read("op://vault/item", cancel=cancel))
+            self.assertTrue(closed)
 
     def test_cleanup_exception_is_sanitized_and_cannot_return_payload(self):
         with mock.patch.object(opread.subprocess, "Popen", return_value=self.fake_payload(b'{"secret":1}')), \
@@ -928,23 +1128,57 @@ class OpreadTests(unittest.TestCase):
             self.assertEqual(errors.getvalue(), "")
 
     def test_real_running_read_timeout_and_cancel_suppress_partial_payload(self):
-        import threading
+        import subprocess
+        from textwrap import dedent
+
+        harness = dedent("""
+            import subprocess
+            import sys
+            from pathlib import Path
+            from unittest import mock
+            from lib import opread
+
+            ready = Path(sys.argv[1])
+            timed = sys.argv[2] == "timeout"
+            code = (
+                "import os,time,signal; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+                "os.write(1,b'partial synthetic credential'); "
+                "os.write(2,b'synthetic private diagnostic'); "
+                f"open({str(ready)!r},'w').close(); time.sleep(30)"
+            )
+            real = subprocess.Popen
+
+            def spawn(args, **kwargs):
+                return real([sys.executable, "-S", "-c", code], **kwargs)
+
+            def resolve(*args, **kwargs):
+                return "/fake/op", "1"
+
+            class CancelWhenReady:
+                def is_set(self):
+                    return ready.exists()
+
+            with mock.patch.object(opread.subprocess, "Popen", side_effect=spawn), \\
+                 mock.patch.object(opread, "resolve_op", side_effect=resolve):
+                try:
+                    data = opread.read(
+                        "op://vault/item", env={}, timeout=1.5 if timed else None,
+                        cancel=None if timed else CancelWhenReady(),
+                    )
+                    sys.stdout.buffer.write(data)
+                except (opread.OpreadTimeoutError if timed else opread.OpreadCancelledError) as error:
+                    sys.exit(error.returncode)
+        """)
         for timed in (False, True):
-            event = threading.Event()
-            timer = None
-            if not timed:
-                timer = threading.Timer(.15, event.set)
-                timer.start()
-            started = time.monotonic()
-            try:
-                kind = opread.OpreadTimeoutError if timed else opread.OpreadCancelledError
-                with self.assertRaises(kind):
-                    self.run_real_read("import os,time,signal; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
-                                       "os.write(1,b'partial secret'); time.sleep(30)",
-                                       timeout=.15 if timed else None, cancel=event)
-                self.assertLess(time.monotonic() - started, 2)
-            finally:
-                if timer: timer.join()
+            with self.subTest(timed=timed), tempfile.TemporaryDirectory() as directory:
+                ready = Path(directory) / "ready"
+                result = subprocess.run(
+                    [sys.executable, "-c", harness, str(ready), "timeout" if timed else "cancel"],
+                    cwd=SCRIPT.parent, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=6,
+                )
+                self.assertTrue(ready.exists())
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (124 if timed else 130, b"", b""))
 
     def test_real_probes_cancel_timeout_and_publication_cleanup(self):
         import threading

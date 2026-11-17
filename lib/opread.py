@@ -19,6 +19,7 @@ UNSUPPORTED_ARGUMENTS_ERROR = (
     "opread does not support extra op read arguments (for example --no-newline or --out-file); "
     "use: opread REF [REASON]"
 )
+_INVALID_TIMEOUT_MESSAGE = "timeout must be a finite nonnegative number of seconds"
 
 
 def select_python_runtime():
@@ -95,6 +96,8 @@ def resolve_op(env=None, *, _context=None):
                     "PATH-selected 'op' timed out running " + option + ": " + path
                 ) from None
             except OSError as exc:
+                if not context.diagnostics:
+                    raise
                 raise RuntimeError(
                     "cannot run PATH-selected 'op' " + option + ": " + str(exc)
                 ) from None
@@ -328,19 +331,29 @@ class _ProbeTimeout(Exception):
     pass
 
 
+class _InvalidTimeout(ValueError):
+    pass
+
+
 class _ReadContext:
     """Per-call control and ownership; no process-global environment or handlers."""
 
-    def __init__(self, timeout=None, cancel=None, pending=None):
+    def __init__(self, timeout=None, cancel=None, pending=None, *, diagnostics=True):
         started = time.monotonic()
+        self.deadline = None
         if timeout is not None:
-            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
-                raise ValueError("timeout must be a finite nonnegative number of seconds")
-            if not math.isfinite(timeout) or timeout < 0:
-                raise ValueError("timeout must be a finite nonnegative number of seconds")
-        self.deadline = None if timeout is None else started + timeout
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
+                raise _InvalidTimeout()
+            try:
+                deadline = started + timeout
+            except OverflowError:
+                raise _InvalidTimeout() from None
+            if not math.isfinite(deadline):
+                raise _InvalidTimeout()
+            self.deadline = deadline
         self.cancel = cancel
         self.pending = pending
+        self.diagnostics = diagnostics
         self.children = []
         self.cleanup_remaining = 5.0
         self.cleanup_failed = False
@@ -469,18 +482,43 @@ def main():
 
 def read(reference, reason=None, *, env=None, timeout=None, cancel=None):
     """Return exact credential bytes with optional timeout and cooperative cancellation."""
-    context = _ReadContext(timeout, cancel)
-    snapshot = dict(os.environ if env is None else env)
-    return _read(reference, reason, snapshot, context)
+    return _library_read(reference, reason, env, timeout, cancel)
 
 
 def get_item(item, reason=None, *, vault, account=None, env=None, timeout=None, cancel=None):
     """Return a whole item as a parsed dict; suppress item diagnostics."""
-    context = _ReadContext(timeout, cancel)
-    snapshot = dict(os.environ if env is None else env)
-    if account is not None:
-        snapshot["OP_ACCOUNT"] = account
-    return _read(item, reason, snapshot, context, vault=vault, account=account, item_mode=True)
+    return _library_read(item, reason, env, timeout, cancel,
+                         vault=vault, account=account, item_mode=True)
+
+
+def _library_read(reference, reason, env, timeout, cancel, *,
+                  vault=None, account=None, item_mode=False):
+    context = None
+    try:
+        context = _ReadContext(timeout, cancel, diagnostics=False)
+        snapshot = dict(os.environ if env is None else env)
+        if account is not None:
+            snapshot["OP_ACCOUNT"] = account
+        return _read(reference, reason, snapshot, context,
+                     vault=vault, account=account, item_mode=item_mode)
+    except Exception as exc:
+        kind = type(exc)
+        if context is None and kind is _InvalidTimeout:
+            failure = ValueError(_INVALID_TIMEOUT_MESSAGE)
+        elif kind is OpreadTimeoutError:
+            failure = OpreadTimeoutError()
+        elif kind is OpreadCancelledError:
+            failure = OpreadCancelledError()
+        else:
+            status = getattr(exc, "returncode", None) if kind is OpreadError else None
+            failure = OpreadError(status if type(status) is int and 1 <= status <= 255 else 69)
+
+    try:
+        raise failure from None
+    except (OpreadError, ValueError):
+        # Python can attach an exception already being handled by the caller.
+        failure.__context__ = None
+        raise
 
 
 def _cli_read(reference, reason=None):
@@ -542,7 +580,8 @@ def _read(reference, reason, env, context, *, vault=None, account=None, item_mod
                      if item_mode else display_label(reference, reason))
             identity = desktop_identity(label)
         except (ValueError, UnicodeError, TypeError, AttributeError) as exc:
-            print("opread: invalid item request" if item_mode else str(exc), file=sys.stderr)
+            if context.diagnostics:
+                print(str(exc), file=sys.stderr)
             raise OpreadError(2) from None
 
         incompatible = ("OP_SERVICE_ACCOUNT_TOKEN", "OP_CONNECT_HOST", "OP_CONNECT_TOKEN", "OP_SESSION")
@@ -552,8 +591,9 @@ def _read(reference, reason, env, context, *, vault=None, account=None, item_mod
         )
         if (any(env.get(name) for name in incompatible) or manual_session
                 or env.get("OP_BIOMETRIC_UNLOCK_ENABLED", "").lower() == "false"):
-            print("opread requires interactive desktop authentication; a non-interactive 1Password backend is configured",
-                  file=sys.stderr)
+            if context.diagnostics:
+                print("opread requires interactive desktop authentication; a non-interactive 1Password backend is configured",
+                      file=sys.stderr)
             raise OpreadError(2)
 
         op_path, _op_version = resolve_op(env, _context=context)
@@ -565,7 +605,8 @@ def _read(reference, reason, env, context, *, vault=None, account=None, item_mod
         try:
             source_python, python_home = select_python_runtime()
         except RuntimeError as exc:
-            print("opread: item read failed" if item_mode else str(exc), file=sys.stderr)
+            if context.diagnostics:
+                print(str(exc), file=sys.stderr)
             raise OpreadError(69) from None
         context.check()
         shutil.copyfile(source_python, executable)
@@ -575,13 +616,13 @@ def _read(reference, reason, env, context, *, vault=None, account=None, item_mod
         child_env["PYTHONHOME"] = python_home
         child_env["OP_BIOMETRIC_UNLOCK_ENABLED"] = "true"
         args = [executable, os.path.abspath(__file__), "--gui-child", reference, label, op_path]
-        kwargs = {}
+        stderr = None if context.diagnostics else subprocess.DEVNULL
         if item_mode:
             args[2] = "--gui-item-child"
             args += [vault, account or ""]
-            kwargs["stderr"] = subprocess.PIPE
+            stderr = subprocess.PIPE
         child = context.spawn(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                              start_new_session=True, env=child_env, **kwargs)
+                              stderr=stderr, start_new_session=True, env=child_env)
         collected = context.collect(child)
         status = child.returncode
         status = status if status >= 0 else 128 - status
@@ -600,11 +641,9 @@ def _read(reference, reason, env, context, *, vault=None, account=None, item_mod
     except OpreadError as exc:
         failure = exc
     except Exception as exc:
-        # Item payloads and exception text (including JSON decoder excerpts) must
-        # never become diagnostics. Field reads retain their existing diagnostics.
-        if item_mode:
-            diagnostic = "opread: item read failed"
-        elif isinstance(exc, OSError):
+        if not context.diagnostics:
+            raise
+        if isinstance(exc, OSError):
             diagnostic = "cannot prepare opread prompt: " + str(exc)
         else:
             diagnostic = "opread: " + str(exc)
@@ -613,19 +652,26 @@ def _read(reference, reason, env, context, *, vault=None, account=None, item_mod
     finally:
         try:
             context.close()
+        except Exception:
+            context.cleanup_failed = True
         finally:
             if executable is not None:
                 try:
                     os.unlink(executable)
                 except OSError:
                     pass
+                except Exception:
+                    context.cleanup_failed = True
             if tempdir is not None:
                 try:
                     os.rmdir(tempdir)
                 except OSError:
                     pass
+                except Exception:
+                    context.cleanup_failed = True
     if failure is None and context.cleanup_failed:
-        print("opread: cannot finish cleanup", file=sys.stderr)
+        if context.diagnostics:
+            print("opread: cannot finish cleanup", file=sys.stderr)
         failure = OpreadError(69)
     # CLI signals retain their historical precedence over child failures.
     # Library calls have no pending signal state and keep failure-first semantics.
