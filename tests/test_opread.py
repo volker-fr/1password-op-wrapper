@@ -460,7 +460,7 @@ class OpreadTests(unittest.TestCase):
                  mock.patch.object(opread.sys, "argv", ["opread", "op://vault/item"]), \
                  mock.patch.object(opread.sys, "stdout", stream), \
                  mock.patch.object(opread, "neutralize_stdout") as neutralize, \
-                 mock.patch.object(opread, "read", return_value=b"data"), \
+                 mock.patch.object(opread, "_cli_read", return_value=b"data"), \
                  contextlib.redirect_stderr(io.StringIO()) as errors:
                 self.assertEqual(opread.main(), expected)
             neutralize.assert_called_once()
@@ -470,7 +470,7 @@ class OpreadTests(unittest.TestCase):
         import subprocess
         for size in (1, 200000):
             code = ("import sys; from lib import opread; "
-                    f"opread.read=lambda *a: b'x'*{size}; "
+                    f"opread._cli_read=lambda *a: b'x'*{size}; "
                     "sys.argv=['opread','op://vault/item']; "
                     "raise SystemExit(opread.main())")
             with self.subTest(size=size):
@@ -500,7 +500,7 @@ class OpreadTests(unittest.TestCase):
                        "real=subprocess.Popen; "
                        f"code={child_code!r}; "
                        "spawn=lambda *a,**k: real([sys.executable,'-c',code],stdout=subprocess.PIPE,start_new_session=True); "
-                       "opread.resolve_op=lambda: ('/fake/op','1'); "
+                       "opread.resolve_op=lambda *a: ('/fake/op','1'); "
                        "p=mock.patch.object(opread.subprocess,'Popen',side_effect=spawn); p.start(); "
                        "\ntry:\n data=opread.read('op://vault/item'); sys.stdout.buffer.write(data)\n"
                        "except opread.OpreadError as e:\n sys.exit(e.returncode)\n")
@@ -529,7 +529,7 @@ class OpreadTests(unittest.TestCase):
                            "real=subprocess.Popen; "
                            f"code={leader!r}; path={str(leaderfile)!r}; "
                            "\ndef spawn(*a,**k):\n p=real([sys.executable,'-c',code],stdout=subprocess.PIPE,start_new_session=True); open(path,'w').write(str(p.pid)); return p\n"
-                           "opread.resolve_op=lambda: ('/fake/op','1')\n"
+                           "opread.resolve_op=lambda *a: ('/fake/op','1')\n"
                            "with mock.patch.object(opread.subprocess,'Popen',side_effect=spawn):\n"
                            " try: sys.stdout.buffer.write(opread.read('op://vault/item'))\n"
                            " except opread.OpreadError as e: sys.exit(e.returncode)\n")
@@ -556,6 +556,81 @@ class OpreadTests(unittest.TestCase):
                             except ProcessLookupError:
                                 pass
                     proc.communicate(timeout=2)
+
+    def test_worker_reads_concurrently_with_isolated_replacement_environments(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import subprocess
+        self.op_resolver.stop()
+        self.addCleanup(self.op_resolver.start)
+        with tempfile.TemporaryDirectory() as directory:
+            executable = self.make_fake_op(directory)
+            original = dict(os.environ)
+            envs = [{"PATH": directory, "OP_ACCOUNT": account, "OP_CONFIG_DIR": account,
+                     "PYTHONPATH": "must-be-removed"} for account in ("one", "two")]
+            saved = [dict(env) for env in envs]
+            real_popen = subprocess.Popen
+            code = ("import os,sys; os.write(2,b'worker diagnostic\\n'); "
+                    "os.write(1,(os.environ['OP_ACCOUNT']+':'+os.environ['OP_CONFIG_DIR']).encode()); "
+                    "sys.exit(7 if os.environ['OP_ACCOUNT']=='two' else 0)")
+            def spawn(args, **kwargs):
+                if args[0] == str(executable.resolve()):
+                    return real_popen(args, **kwargs)
+                self.assertNotIn("PYTHONPATH", kwargs["env"])
+                self.assertEqual(kwargs["env"]["OP_BIOMETRIC_UNLOCK_ENABLED"], "true")
+                return real_popen([sys.executable, "-c", code], **kwargs)
+            def worker(env):
+                try:
+                    return opread.read("op://vault/item", env=env)
+                except opread.OpreadError as exc:
+                    return exc.returncode
+            handlers = {sig: opread.signal.getsignal(sig) for sig in
+                        (opread.signal.SIGINT, opread.signal.SIGTERM, opread.signal.SIGHUP)}
+            with mock.patch.object(opread.subprocess, "Popen", side_effect=spawn), \
+                 mock.patch.object(opread.signal, "signal", side_effect=AssertionError("signal handler changed")):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    results = list(pool.map(worker, envs))
+            self.assertEqual(results, [b"one:one", 7])
+            self.assertEqual(envs, saved)
+            self.assertEqual(dict(os.environ), original)
+            self.assertEqual(handlers, {sig: opread.signal.getsignal(sig) for sig in handlers})
+
+    def test_resolver_and_backend_use_replacement_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = self.make_fake_op(directory)
+            with mock.patch.dict(os.environ, {"PATH": "/nonexistent", "OP_CONNECT_TOKEN": "ignored"}), \
+                 mock.patch.object(opread.subprocess, "run", wraps=opread.subprocess.run) as run:
+                self.assertEqual(REAL_RESOLVE_OP({"PATH": directory, "OP_ACCOUNT": "isolated"})[0], str(executable))
+            for call in run.call_args_list:
+                self.assertEqual(call.kwargs["env"]["OP_ACCOUNT"], "isolated")
+                self.assertNotIn("OP_CONNECT_TOKEN", call.kwargs["env"])
+            with mock.patch.object(opread.shutil, "which", return_value=None) as which:
+                with self.assertRaises(RuntimeError):
+                    REAL_RESOLVE_OP({})
+                which.assert_called_once_with("op", path=os.defpath)
+            with mock.patch.object(opread, "resolve_op", side_effect=RuntimeError("reached resolver")), \
+                 mock.patch.dict(os.environ, {"OP_CONNECT_TOKEN": "ignored"}), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(opread.OpreadError) as caught:
+                    opread.read("op://vault/item", env={})
+                self.assertEqual(caught.exception.returncode, 69)
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(opread.OpreadError) as caught:
+                    opread.read("op://vault/item", env={"OP_CONNECT_TOKEN": "rejected"})
+                self.assertEqual(caught.exception.returncode, 2)
+
+    def test_cli_restores_handlers_for_all_interrupt_signals(self):
+        for sig, status in ((opread.signal.SIGINT, 130), (opread.signal.SIGTERM, 143),
+                            (opread.signal.SIGHUP, 129)):
+            before = {s: opread.signal.getsignal(s) for s in
+                      (opread.signal.SIGINT, opread.signal.SIGTERM, opread.signal.SIGHUP)}
+            def interrupt(*args):
+                os.kill(os.getpid(), sig)
+                return ("/validated/bin/op", "1")
+            with self.subTest(sig=sig), mock.patch.object(opread, "resolve_op", side_effect=interrupt):
+                with self.assertRaises(opread.OpreadError) as caught:
+                    opread._cli_read("op://vault/item")
+                self.assertEqual(caught.exception.returncode, status)
+                self.assertEqual(before, {s: opread.signal.getsignal(s) for s in before})
 
     def test_backend_conflict_is_reported_without_echoing_value(self):
         with mock.patch.dict(opread.os.environ, {"OP_CONNECT_TOKEN": "secret-token"}, clear=False), \

@@ -58,9 +58,10 @@ def check_runtime():
     return 0
 
 
-def resolve_op():
+def resolve_op(env=None):
     """Find and identify the PATH-selected 1Password CLI without authenticating."""
-    candidate = shutil.which("op")
+    env = dict(os.environ if env is None else env)
+    candidate = shutil.which("op", path=env.get("PATH", os.defpath))
     if candidate is None:
         raise RuntimeError(
             "cannot find executable 'op' on PATH; install 1Password CLI and check PATH"
@@ -68,7 +69,6 @@ def resolve_op():
     path = os.path.realpath(candidate)
     if not os.path.isfile(path) or not os.access(path, os.X_OK):
         raise RuntimeError("PATH-selected 'op' is not an executable file: " + path)
-    env = os.environ.copy()
     env["NO_COLOR"] = "1"
     env["OP_COLOR"] = "never"
     outputs = []
@@ -330,7 +330,7 @@ def main():
     reference = arguments[0]
     reason = arguments[1] if len(arguments) == 2 else None
     try:
-        output = read(reference, reason)
+        output = _cli_read(reference, reason)
     except OpreadError as exc:
         return exc.returncode
     try:
@@ -346,8 +346,30 @@ def main():
     return 0
 
 
-def read(reference, reason=None):
-    """Return the exact credential bytes, or raise OpreadError on failure."""
+def read(reference, reason=None, *, env=None):
+    """Return exact credential bytes using a snapshot of the supplied environment."""
+    snapshot = dict(os.environ if env is None else env)
+    return _read(reference, reason, snapshot, {"signal": None})
+
+
+def _cli_read(reference, reason=None):
+    pending = {"signal": None}
+    old_handlers = {}
+
+    def interrupted(signum, _frame):
+        if pending["signal"] is None:
+            pending["signal"] = signum
+
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            old_handlers[sig] = signal.signal(sig, interrupted)
+        return _read(reference, reason, dict(os.environ), pending)
+    finally:
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
+
+
+def _read(reference, reason, env, pending):
     if reference.startswith("-") or (reason is not None and reason.startswith("-")):
         print(UNSUPPORTED_ARGUMENTS_ERROR, file=sys.stderr)
         raise OpreadError(2)
@@ -371,28 +393,18 @@ def read(reference, reason=None):
         name.startswith("OP_SESSION_")
         and name != "OP_SESSION_DELEGATION_ENABLED"
         and value
-        for name, value in os.environ.items()
+        for name, value in env.items()
     )
     if (
-        any(os.environ.get(name) for name in incompatible)
+        any(env.get(name) for name in incompatible)
         or manual_session
-        or os.environ.get("OP_BIOMETRIC_UNLOCK_ENABLED", "").lower() == "false"
+        or env.get("OP_BIOMETRIC_UNLOCK_ENABLED", "").lower() == "false"
     ):
         print(
             "opread requires interactive desktop authentication; a non-interactive 1Password backend is configured",
             file=sys.stderr,
         )
         raise OpreadError(2)
-
-    pending = {"signal": None}
-    old_handlers = {}
-
-    def interrupted(signum, _frame):
-        if pending["signal"] is None:
-            pending["signal"] = signum
-
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        old_handlers[sig] = signal.signal(sig, interrupted)
 
     # The compositor derives the prompt identity from the executable basename.
     # Run a private copy of the system interpreter under that basename.
@@ -404,7 +416,7 @@ def read(reference, reason=None):
     try:
         op_path = None
         try:
-            op_path, _op_version = resolve_op()
+            op_path, _op_version = resolve_op(env)
         except RuntimeError as exc:
             print("opread: " + str(exc), file=sys.stderr)
         if pending["signal"] is None and op_path is not None:
@@ -422,11 +434,9 @@ def read(reference, reason=None):
             shutil.copyfile(source_python, executable)
             if pending["signal"] is None:
                 os.chmod(executable, 0o700)
-                env = {
-                    k: v for k, v in os.environ.items() if not k.startswith("PYTHON")
-                }
-                env["PYTHONHOME"] = python_home
-                env["OP_BIOMETRIC_UNLOCK_ENABLED"] = "true"
+                child_env = {k: v for k, v in env.items() if not k.startswith("PYTHON")}
+                child_env["PYTHONHOME"] = python_home
+                child_env["OP_BIOMETRIC_UNLOCK_ENABLED"] = "true"
                 if pending["signal"] is None:
                     child = subprocess.Popen(
                         [
@@ -440,7 +450,7 @@ def read(reference, reason=None):
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.PIPE,
                         start_new_session=True,
-                        env=env,
+                        env=child_env,
                     )
                     while pending["signal"] is None:
                         try:
@@ -478,8 +488,6 @@ def read(reference, reason=None):
                 os.rmdir(tempdir)
             except OSError:
                 pass
-        for sig, handler in old_handlers.items():
-            signal.signal(sig, handler)
     if pending["signal"] is not None:
         status = {signal.SIGINT: 130, signal.SIGTERM: 143, signal.SIGHUP: 129}[
             pending["signal"]

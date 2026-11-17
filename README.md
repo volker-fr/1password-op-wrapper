@@ -18,7 +18,7 @@ The requested labels are `password-item/key` and `password-item/key: provided re
 
 ## Python usage
 
-With the repository on Python's import path, call from the main thread:
+With the repository on Python's import path, call from the main thread or a worker thread:
 
 ```python
 from lib.opread import OpreadError, read
@@ -29,7 +29,9 @@ except OpreadError as error:
     print(f"Read failed with status {error.returncode}")
 ```
 
-`read` returns the exact credential bytes on success and raises `OpreadError` with a `returncode` on failure. Diagnostics go to standard error. It must run on the main thread because it installs signal handlers.
+`read` returns the exact credential bytes on success and raises `OpreadError` with a `returncode` on failure. Diagnostics go to standard error. The optional keyword-only `env` mapping replaces the inherited environment, as with `subprocess`; it is copied once per call. If omitted, the current process environment is copied once. Include any required `PATH`, display, and 1Password configuration variables. A missing `PATH` uses the system default search path. Concurrent calls can use separate account or configuration settings without changing the process environment, but this does not isolate or alter 1Password sessions.
+
+`read` does not install process signal handlers. The caller owns signal handling and cancellation; `Future.cancel()` cannot stop a read that is already running. Normal exceptions clean up the helper, but an abrupt default SIGTERM or SIGHUP can terminate the process before cleanup. The CLI manages these signals itself.
 
 The CLI buffers the complete credential in memory and writes it to standard output only after a successful read; partial output from a failed read is suppressed. Large credentials therefore require corresponding memory. A later output write failure can still leave a partial write.
 
