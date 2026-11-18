@@ -8,7 +8,7 @@ help: ## Show available targets
 
 check: ## Check required executables, GTK bindings, and GUI environment
 	@status=0; \
-	$(PYTHON) opread.py --check-runtime || status=1; \
+	$(PYTHON) op-wrapper.py --check-runtime || status=1; \
 	if [ -n "$$WAYLAND_DISPLAY" ]; then echo 'GUI environment: WAYLAND_DISPLAY is set'; else echo 'GUI environment: WAYLAND_DISPLAY is not set'; fi; \
 	if [ -n "$$DISPLAY" ]; then echo 'GUI environment: DISPLAY is set'; else echo 'GUI environment: DISPLAY is not set'; fi; \
 	if [ -n "$$WAYLAND_DISPLAY" ]; then \

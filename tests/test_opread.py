@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "opread.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "op-wrapper.py"
 spec = importlib.util.spec_from_file_location("opread_under_test", SCRIPT.parent / "lib" / "opread.py")
 opread = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(opread)
@@ -751,6 +751,149 @@ class OpreadTests(unittest.TestCase):
             self.assertEqual(error.exception.returncode, 69)
             self.assertNotIn("secret", errors.getvalue())
 
+    def test_json_cli_runs_fixed_commands_and_preserves_payload_bytes(self):
+        cases = (
+            (["item", "get", "name with spaces", "--vault", "private-vault"],
+             "WHOLE ITEM: name with spaces", b' {"id":"a"}\n\n',
+             ["item", "get", "name with spaces", "--vault", "private-vault", "--format", "json"]),
+            (["item", "list", "--vault", "private-vault", "--account", "chosen-account"],
+             "LIST ITEMS", b' [{"id":"a"}]\n\n',
+             ["item", "list", "--vault", "private-vault", "--format", "json", "--account", "chosen-account"]),
+            (["item", "list"], "LIST ITEMS", b' []\n', ["item", "list", "--format", "json"]),
+            (["vault", "list", "--account", "chosen-account"],
+             "LIST VAULTS", b' [{"id":"v"}]\n', ["vault", "list", "--format", "json", "--account", "chosen-account"]),
+            (["account", "list"], "LIST ACCOUNTS", b' []\n', ["account", "list", "--format", "json"]),
+        )
+        for argv, label, payload, expected in cases:
+            child = self.fake_payload(payload)
+            output = types.SimpleNamespace(buffer=io.BytesIO())
+            with self.subTest(argv=argv), \
+                 mock.patch.dict(opread.os.environ, {"OP_ACCOUNT": "ambient-account"}), \
+                 mock.patch.object(opread.sys, "argv", ["opread", *argv, "--reason", "backup"]), \
+                 mock.patch.object(opread, "resolve_op", return_value=("/validated/bin/op", "2.41.1")) as resolve, \
+                 mock.patch.object(opread.subprocess, "Popen", return_value=child) as spawn, \
+                 mock.patch.object(opread, "terminate_process_group"), \
+                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(opread.main(), 0)
+                self.assertEqual(opread.os.environ["OP_ACCOUNT"], "ambient-account")
+            self.assertEqual(output.buffer.getvalue(), payload)
+            self.assertEqual(errors.getvalue(), "")
+            args = spawn.call_args.args[0]
+            kwargs = spawn.call_args.kwargs
+            account = "chosen-account" if "--account" in argv else "ambient-account"
+            self.assertEqual(resolve.call_args.args[0]["OP_ACCOUNT"], account)
+            self.assertEqual(kwargs["env"]["OP_ACCOUNT"], account)
+            self.assertEqual(kwargs["stdin"], opread.subprocess.DEVNULL)
+            self.assertEqual(kwargs["stderr"], opread.subprocess.PIPE)
+            with self.fake_gui() as gui, mock.patch.object(opread.sys, "argv", args[1:]):
+                gui.popen.return_value = Child(0)
+                def drive_gui():
+                    gui.timers[1][1]()
+                    gui.timers[3][1]()
+                gui.gtk.main.side_effect = drive_gui
+                self.assertEqual(opread.main(), 0)
+                gui.popen.assert_called_once_with(["/validated/bin/op", *expected])
+                gui.gtk.Window.assert_called_once_with(title=label + ": backup")
+
+    def test_list_functions_return_object_arrays_and_accept_controls(self):
+        from threading import Event
+
+        cases = (
+            (opread.list_items, {"vault": "private-vault", "account": "chosen-account"},
+             ["item-list", "LIST ITEMS: inventory", "/validated/bin/op", "private-vault", "chosen-account"]),
+            (opread.list_vaults, {"account": "chosen-account"},
+             ["vault-list", "LIST VAULTS: inventory", "/validated/bin/op", "", "chosen-account"]),
+            (opread.list_accounts, {},
+             ["account-list", "LIST ACCOUNTS: inventory", "/validated/bin/op", "", ""]),
+        )
+        for invoke, selectors, expected in cases:
+            cancel = Event()
+            child = self.fake_payload(b'[{"id":"a"},{"id":"b"}]')
+            with self.subTest(invoke=invoke.__name__), \
+                 mock.patch.object(opread.subprocess, "Popen", return_value=child) as spawn, \
+                 mock.patch.object(opread, "terminate_process_group"):
+                self.assertEqual(invoke("inventory", timeout=10, cancel=cancel, **selectors),
+                                 [{"id": "a"}, {"id": "b"}])
+                self.assertEqual(spawn.call_args.args[0][2:], ["--gui-list-child", *expected])
+                spawn.reset_mock()
+                cancel.set()
+                with self.assertRaises(opread.OpreadCancelledError):
+                    invoke(cancel=cancel, **selectors)
+                spawn.assert_not_called()
+
+    def test_lists_reject_invalid_json_without_revealing_output_or_stderr(self):
+        invalid = (b'{"secret":1}', b'["secret"]', b'[{},null]', b' [{"secret":NaN}]',
+                   b' [{"secret":Infinity}]', b'[] secret', b'\xffsecret')
+        for payload, status in [(payload, 0) for payload in invalid] + [(b'[]', 7)]:
+            child = self.fake_payload(payload, status)
+            cli_output = types.SimpleNamespace(buffer=io.BytesIO())
+            with self.subTest(payload=payload, status=status), \
+                 mock.patch.object(opread.subprocess, "Popen", return_value=child), \
+                 mock.patch.object(opread, "terminate_process_group"), \
+                 mock.patch.object(opread.sys, "argv", ["opread", "item", "list"]), \
+                 contextlib.redirect_stdout(cli_output), contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(opread.main(), status or 69)
+            self.assertEqual(cli_output.buffer.getvalue(), b"")
+            self.assertNotIn("secret", errors.getvalue())
+            child = self.fake_payload(payload, status)
+            with mock.patch.object(opread.subprocess, "Popen", return_value=child), \
+                 mock.patch.object(opread, "terminate_process_group"):
+                self.assert_quiet_library_failure(opread.list_items, status=status or 69)
+
+    def test_json_cli_rejects_extra_commands_and_flags_before_probing(self):
+        cases = (
+            ["item", "secret-command"],
+            ["item", "get", "secret-item"],
+            ["item", "get", "secret-item", "--vau", "secret-vault"],
+            ["item", "get", "secret-item", "--vault=", "--account", "secret-account"],
+            ["item", "list", "--format", "secret-format"],
+            ["item", "list", "--include-archive"],
+            ["item", "list", "--vault=--secret-option"],
+            ["vault", "list", "--vault", "secret-vault"],
+            ["account", "list", "--account", "secret-account"],
+            ["account", "list", "--reason=-secret-reason"],
+        )
+        for argv in cases:
+            with self.subTest(argv=argv), \
+                 mock.patch.object(opread.sys, "argv", ["opread", *argv]), \
+                 mock.patch.object(opread, "resolve_op") as resolve, \
+                 mock.patch.object(opread.subprocess, "Popen") as spawn, \
+                 contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(opread.main(), 2)
+            resolve.assert_not_called()
+            spawn.assert_not_called()
+            self.assertNotIn("secret", errors.getvalue())
+
+    def test_helper_rejects_unknown_operations_and_unsafe_selectors(self):
+        cases = (
+            ["--gui-list-child", "secret-operation", "label", "/op", "", ""],
+            ["--gui-list-child", "item-list", "label", "/op", "--secret-option", ""],
+            ["--gui-list-child", "vault-list", "label", "/op", "secret-vault", ""],
+            ["--gui-list-child", "account-list", "label", "/op", "", "secret-account"],
+            ["--gui-item-child", "--secret-item", "label", "/op", "vault", ""],
+        )
+        for argv in cases:
+            with self.subTest(argv=argv), \
+                 mock.patch.object(opread.sys, "argv", ["opread", *argv]), \
+                 self.fake_gui() as gui, contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(opread.main(), 70)
+                gui.gtk.Window.assert_not_called()
+                gui.popen.assert_not_called()
+            self.assertNotIn("secret", errors.getvalue())
+
+    def test_json_cli_signal_during_collection_cleanup_suppresses_output(self):
+        child = self.fake_payload(b'[{"id":"a"}]')
+        signal = opread.signal.SIGTERM
+        previous = opread.signal.getsignal(signal)
+        with mock.patch.object(opread.sys, "argv", ["opread", "account", "list"]), \
+             mock.patch.object(opread.subprocess, "Popen", return_value=child), \
+             mock.patch.object(opread, "terminate_process_group",
+                               side_effect=lambda *a, **k: os.kill(os.getpid(), signal)), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(opread.main(), 143)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(opread.signal.getsignal(signal), previous)
+
     def test_timeout_validation_and_immediate_control_before_acquisition(self):
         import threading
         for value in (-1, float("nan"), float("inf"), "1", True):
@@ -915,7 +1058,8 @@ class OpreadTests(unittest.TestCase):
                     rendered = "".join(traceback.format_exception(type(error), error, error.__traceback__))
                     self.assertNotIn(PRIVATE_SENTINEL, rendered)
                     frames = traceback.extract_tb(error.__traceback__)
-                    self.assertIn(frames[-2].name, ("read", "get_item"))
+                    self.assertIn(frames[-2].name, ("read", "get_item", "list_items",
+                                                    "list_vaults", "list_accounts"))
                     self.assertEqual(frames[-1].name, "_library_read")
                 else:
                     self.fail("library call unexpectedly returned a result")

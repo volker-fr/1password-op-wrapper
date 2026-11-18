@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Private GTK prompt that gives an op read request a visible reason label."""
 
+import argparse
 import json
 import math
 import os
@@ -15,11 +16,19 @@ import unicodedata
 
 # This distinctive CLI help-banner text identifies the PATH-selected command because --version alone does not identify its vendor; it is a sanity check, not cryptographic proof, and can be spoofed.
 OP_IDENTITY = "1password cli brings 1password to your terminal."
+_CLI_NAME = "op-wrapper.py"
 UNSUPPORTED_ARGUMENTS_ERROR = (
-    "opread does not support extra op read arguments (for example --no-newline or --out-file); "
-    "use: opread REF [REASON]"
+    "op-wrapper does not support extra op read arguments (for example --no-newline or --out-file); "
+    f"use: {_CLI_NAME} REF [REASON]"
 )
 _INVALID_TIMEOUT_MESSAGE = "timeout must be a finite nonnegative number of seconds"
+_FIELD = "read"
+_ITEM_GET = "item-get"
+_LIST_COMMANDS = {
+    "item-list": ("item", "LIST ITEMS"),
+    "vault-list": ("vault", "LIST VAULTS"),
+    "account-list": ("account", "LIST ACCOUNTS"),
+}
 
 
 def select_python_runtime():
@@ -163,7 +172,24 @@ def desktop_identity(label):
     return "request" if safe in ("", ".", "..") else safe
 
 
-def gui(reference, label, op_path, *, vault=None, account=None):
+def gui(reference, label, op_path, *, vault=None, account=None, operation=None):
+    if operation is None:
+        operation = _FIELD if vault is None else _ITEM_GET
+    if operation == _FIELD:
+        validate_reference(reference)
+        command = [op_path, "read", reference]
+    else:
+        _validate_json_request(operation, reference, vault, account)
+        if operation == _ITEM_GET:
+            command = [op_path, "item", "get", reference]
+        else:
+            command = [op_path, _LIST_COMMANDS[operation][0], "list"]
+        if vault is not None:
+            command += ["--vault", vault]
+        command += ["--format", "json"]
+        if account is not None:
+            command += ["--account", account]
+
     try:
         import gi
 
@@ -224,11 +250,6 @@ def gui(reference, label, op_path, *, vault=None, account=None):
         if state["proc"] is not None:
             return GLib.SOURCE_REMOVE
         try:
-            command = [op_path, "read", reference]
-            if vault is not None:
-                command = [op_path, "item", "get", reference, "--vault", vault, "--format", "json"]
-                if account is not None:
-                    command += ["--account", account]
             state["proc"] = subprocess.Popen(command)
         except OSError as exc:
             print("cannot start op: " + str(exc), file=sys.stderr)
@@ -435,18 +456,61 @@ def neutralize_stdout():
         pass
 
 
+class _CommandParser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, allow_abbrev=False, **kwargs)
+
+    def error(self, _message):
+        self.print_usage(sys.stderr)
+        self.exit(2, "op-wrapper: invalid or unsupported arguments\n")
+
+
+def _parse_cli_command(arguments):
+    parser = _CommandParser(prog=_CLI_NAME)
+    families = parser.add_subparsers(dest="family", required=True)
+    for family in ("item", "vault", "account"):
+        actions = families.add_parser(family).add_subparsers(dest="action", required=True)
+        for action in (("get", "list") if family == "item" else ("list",)):
+            command = actions.add_parser(action)
+            if action == "get":
+                command.add_argument("item", metavar="ITEM")
+                command.usage = "%(prog)s ITEM --vault VAULT [--account ACCOUNT] [--reason REASON]"
+            if family == "item":
+                command.add_argument("--vault", metavar="VAULT", required=action == "get")
+            if family != "account":
+                command.add_argument("--account", metavar="ACCOUNT")
+            command.add_argument("--reason", metavar="REASON")
+            command.set_defaults(item=None, vault=None, account=None)
+    return parser.parse_args(arguments)
+
+
 def main():
     if len(sys.argv) == 2 and sys.argv[1] == "--check-runtime":
         return check_runtime()
     if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help"):
-        print("usage: opread REF [REASON]\n\nShow a labeled 1Password CLI read prompt.")
+        print(f"usage: {_CLI_NAME} REF [REASON]\n"
+              f"       {_CLI_NAME} item get ITEM --vault VAULT [--account ACCOUNT] [--reason REASON]\n"
+              f"       {_CLI_NAME} item list [--vault VAULT] [--account ACCOUNT] [--reason REASON]\n"
+              f"       {_CLI_NAME} vault list [--account ACCOUNT] [--reason REASON]\n"
+              f"       {_CLI_NAME} account list [--reason REASON]\n\n"
+              "Show a labeled 1Password CLI read prompt.")
         return 0
     if len(sys.argv) == 7 and sys.argv[1] == "--gui-item-child":
         try:
             return gui(sys.argv[2], sys.argv[3], sys.argv[4],
-                       vault=sys.argv[5], account=sys.argv[6] or None)
+                       vault=sys.argv[5], account=sys.argv[6] or None, operation=_ITEM_GET)
         except Exception:
             print("opread item prompt failed", file=sys.stderr)
+            return 70
+    if len(sys.argv) == 7 and sys.argv[1] == "--gui-list-child":
+        operation, label, op_path, vault, account = sys.argv[2:]
+        try:
+            if operation not in _LIST_COMMANDS:
+                raise ValueError("invalid list operation")
+            return gui(None, label, op_path, vault=vault or None,
+                       account=account or None, operation=operation)
+        except Exception:
+            print("opread list prompt failed", file=sys.stderr)
             return 70
     if len(sys.argv) == 5 and sys.argv[1] == "--gui-child":
         try:
@@ -455,16 +519,24 @@ def main():
             print("opread prompt failed: " + str(exc), file=sys.stderr)
             return 70
     arguments = sys.argv[1:]
-    if len(arguments) > 2 or any(argument.startswith("-") for argument in arguments):
-        print(UNSUPPORTED_ARGUMENTS_ERROR, file=sys.stderr)
-        return 2
-    if len(arguments) not in (1, 2):
-        print("usage: opread REF [REASON]", file=sys.stderr)
-        return 2
-    reference = arguments[0]
-    reason = arguments[1] if len(arguments) == 2 else None
     try:
-        output = _cli_read(reference, reason)
+        if arguments and arguments[0] in ("item", "vault", "account"):
+            try:
+                command = _parse_cli_command(arguments)
+            except SystemExit as exc:
+                return exc.code
+            output = _cli_read(command.item, command.reason, vault=command.vault,
+                               account=command.account, operation=command.family + "-" + command.action)
+        else:
+            if len(arguments) > 2 or any(argument.startswith("-") for argument in arguments):
+                print(UNSUPPORTED_ARGUMENTS_ERROR, file=sys.stderr)
+                return 2
+            if len(arguments) not in (1, 2):
+                print(f"usage: {_CLI_NAME} REF [REASON]", file=sys.stderr)
+                return 2
+            reference = arguments[0]
+            reason = arguments[1] if len(arguments) == 2 else None
+            output = _cli_read(reference, reason)
     except OpreadError as exc:
         return exc.returncode
     try:
@@ -488,19 +560,33 @@ def read(reference, reason=None, *, env=None, timeout=None, cancel=None):
 def get_item(item, reason=None, *, vault, account=None, env=None, timeout=None, cancel=None):
     """Return a whole item as a parsed dict; suppress item diagnostics."""
     return _library_read(item, reason, env, timeout, cancel,
-                         vault=vault, account=account, item_mode=True)
+                         vault=vault, account=account, operation=_ITEM_GET)
+
+
+def list_items(reason=None, *, vault=None, account=None, env=None, timeout=None, cancel=None):
+    """Return item summaries as a list of dicts."""
+    return _library_read(None, reason, env, timeout, cancel,
+                         vault=vault, account=account, operation="item-list")
+
+
+def list_vaults(reason=None, *, account=None, env=None, timeout=None, cancel=None):
+    """Return vault summaries as a list of dicts."""
+    return _library_read(None, reason, env, timeout, cancel, account=account, operation="vault-list")
+
+
+def list_accounts(reason=None, *, env=None, timeout=None, cancel=None):
+    """Return configured accounts as a list of dicts."""
+    return _library_read(None, reason, env, timeout, cancel, operation="account-list")
 
 
 def _library_read(reference, reason, env, timeout, cancel, *,
-                  vault=None, account=None, item_mode=False):
+                  vault=None, account=None, operation=_FIELD):
     context = None
     try:
         context = _ReadContext(timeout, cancel, diagnostics=False)
         snapshot = dict(os.environ if env is None else env)
-        if account is not None:
-            snapshot["OP_ACCOUNT"] = account
         return _read(reference, reason, snapshot, context,
-                     vault=vault, account=account, item_mode=item_mode)
+                     vault=vault, account=account, operation=operation)
     except Exception as exc:
         kind = type(exc)
         if context is None and kind is _InvalidTimeout:
@@ -521,7 +607,7 @@ def _library_read(reference, reason, env, timeout, cancel, *,
         raise
 
 
-def _cli_read(reference, reason=None):
+def _cli_read(reference, reason=None, *, vault=None, account=None, operation=_FIELD):
     pending = {"signal": None}
     context = _ReadContext(pending=pending)
     old_handlers = {}
@@ -533,7 +619,8 @@ def _cli_read(reference, reason=None):
     try:
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             old_handlers[sig] = signal.signal(sig, interrupted)
-        return _read(reference, reason, dict(os.environ), context)
+        return _read(reference, reason, dict(os.environ), context,
+                     vault=vault, account=account, operation=operation)
     finally:
         for sig, handler in old_handlers.items():
             signal.signal(sig, handler)
@@ -546,42 +633,73 @@ def _validate_selector(value, name):
         raise ValueError(name + " must be a nonempty, option-safe name or ID (at most 4096 UTF-8 bytes)")
 
 
-def _parse_item_json(output):
+def _validate_json_request(operation, reference, vault, account):
+    # get_item must reject a missing/invalid vault, rather than becoming a field read.
+    if operation == _ITEM_GET:
+        _validate_selector(reference, "ITEM")
+        _validate_selector(vault, "VAULT")
+    elif operation not in _LIST_COMMANDS or reference is not None:
+        raise ValueError("invalid JSON read operation")
+    elif vault is not None:
+        if operation != "item-list":
+            raise ValueError("this operation does not accept a vault")
+        _validate_selector(vault, "VAULT")
+    if account is not None:
+        if operation == "account-list":
+            raise ValueError("this operation does not accept an account")
+        _validate_selector(account, "ACCOUNT")
+
+
+def _parse_json(output):
     def reject_constant(_value):
         raise ValueError("invalid JSON constant")
-    value = json.loads(output.decode("utf-8"), parse_constant=reject_constant)
+    return json.loads(output.decode("utf-8"), parse_constant=reject_constant)
+
+
+def _parse_item_json(output):
+    value = _parse_json(output)
     if not isinstance(value, dict):
         raise ValueError("item JSON must be an object")
     return value
 
 
-def _read(reference, reason, env, context, *, vault=None, account=None, item_mode=False):
-    # get_item must reject a missing/invalid vault, rather than becoming a field read.
+def _parse_list_json(output):
+    value = _parse_json(output)
+    if not isinstance(value, list) or any(not isinstance(entry, dict) for entry in value):
+        raise ValueError("list JSON must be an array of objects")
+    return value
+
+
+def _read(reference, reason, env, context, *, vault=None, account=None, operation=_FIELD):
+    is_field = operation == _FIELD
     tempdir = executable = child = None
     output = None
     failure = None
     try:
         context.check()
         try:
-            if item_mode:
-                _validate_selector(reference, "ITEM")
-                _validate_selector(vault, "VAULT")
-                if account is not None:
-                    _validate_selector(account, "ACCOUNT")
-            else:
+            if is_field:
                 if reference.startswith("-") or (reason is not None and reason.startswith("-")):
                     raise ValueError(UNSUPPORTED_ARGUMENTS_ERROR)
                 validate_reference(reference)
+            else:
+                _validate_json_request(operation, reference, vault, account)
+                if account is not None:
+                    env["OP_ACCOUNT"] = account
             if reason is not None:
                 if reason.startswith("-"):
                     raise ValueError(UNSUPPORTED_ARGUMENTS_ERROR)
                 clean_reason(reason)
-            label = (("WHOLE ITEM: " + reference + (": " + reason if reason is not None else ""))
-                     if item_mode else display_label(reference, reason))
+            if is_field:
+                label = display_label(reference, reason)
+            else:
+                label = "WHOLE ITEM: " + reference if operation == _ITEM_GET else _LIST_COMMANDS[operation][1]
+                if reason is not None:
+                    label += ": " + reason
             identity = desktop_identity(label)
         except (ValueError, UnicodeError, TypeError, AttributeError) as exc:
             if context.diagnostics:
-                print(str(exc), file=sys.stderr)
+                print(str(exc) if is_field else "op-wrapper: invalid request arguments", file=sys.stderr)
             raise OpreadError(2) from None
 
         incompatible = ("OP_SERVICE_ACCOUNT_TOKEN", "OP_CONNECT_HOST", "OP_CONNECT_TOKEN", "OP_SESSION")
@@ -592,7 +710,7 @@ def _read(reference, reason, env, context, *, vault=None, account=None, item_mod
         if (any(env.get(name) for name in incompatible) or manual_session
                 or env.get("OP_BIOMETRIC_UNLOCK_ENABLED", "").lower() == "false"):
             if context.diagnostics:
-                print("opread requires interactive desktop authentication; a non-interactive 1Password backend is configured",
+                print("op-wrapper requires interactive desktop authentication; a non-interactive 1Password backend is configured",
                       file=sys.stderr)
             raise OpreadError(2)
 
@@ -606,7 +724,7 @@ def _read(reference, reason, env, context, *, vault=None, account=None, item_mod
             source_python, python_home = select_python_runtime()
         except RuntimeError as exc:
             if context.diagnostics:
-                print(str(exc), file=sys.stderr)
+                print(str(exc) if is_field else "opread: cannot find Python runtime", file=sys.stderr)
             raise OpreadError(69) from None
         context.check()
         shutil.copyfile(source_python, executable)
@@ -615,11 +733,15 @@ def _read(reference, reason, env, context, *, vault=None, account=None, item_mod
         child_env = {k: v for k, v in env.items() if not k.startswith("PYTHON")}
         child_env["PYTHONHOME"] = python_home
         child_env["OP_BIOMETRIC_UNLOCK_ENABLED"] = "true"
-        args = [executable, os.path.abspath(__file__), "--gui-child", reference, label, op_path]
+        args = [executable, os.path.abspath(__file__)]
         stderr = None if context.diagnostics else subprocess.DEVNULL
-        if item_mode:
-            args[2] = "--gui-item-child"
-            args += [vault, account or ""]
+        if is_field:
+            args += ["--gui-child", reference, label, op_path]
+        elif operation == _ITEM_GET:
+            args += ["--gui-item-child", reference, label, op_path, vault, account or ""]
+        else:
+            args += ["--gui-list-child", operation, label, op_path, vault or "", account or ""]
+        if not is_field:
             stderr = subprocess.PIPE
         child = context.spawn(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                               stderr=stderr, start_new_session=True, env=child_env)
@@ -635,15 +757,19 @@ def _read(reference, reason, env, context, *, vault=None, account=None, item_mod
             raise RuntimeError("cannot collect complete output")
         output = collected[0]
         context.check()
-        if item_mode:
-            output = _parse_item_json(output)
+        if not is_field:
+            parsed = _parse_item_json(output) if operation == _ITEM_GET else _parse_list_json(output)
+            if context.pending is None:
+                output = parsed
         context.check()
     except OpreadError as exc:
         failure = exc
     except Exception as exc:
         if not context.diagnostics:
             raise
-        if isinstance(exc, OSError):
+        if not is_field:
+            diagnostic = "opread: cannot complete JSON request"
+        elif isinstance(exc, OSError):
             diagnostic = "cannot prepare opread prompt: " + str(exc)
         else:
             diagnostic = "opread: " + str(exc)
