@@ -456,6 +456,70 @@ def neutralize_stdout():
         pass
 
 
+_HELP_FLAG = r"--[a-zA-Z0-9][a-zA-Z0-9-]*|-[a-zA-Z0-9]"
+_HELP_DECLARATION = re.compile(rf"^[ \t]{{1,8}}({_HELP_FLAG})(?:,\s+({_HELP_FLAG}))?(?=\s|[=,]|$)")
+_HELP_SECTIONS = {"Flags:", "Global Flags:", "options:", "optional arguments:"}
+
+
+def _help_flags(output):
+    flags = set()
+    in_flags = False
+    for line in output.splitlines():
+        if line and not line[0].isspace():
+            in_flags = line in _HELP_SECTIONS
+        match = _HELP_DECLARATION.match(line) if in_flags else None
+        if match:
+            flags.update(flag for flag in match.groups() if flag)
+    return flags
+
+
+def _native_flag(candidate, family, action):
+    """Identify a flag using only fixed, bounded native help commands."""
+    path = shutil.which("op", path=os.environ.get("PATH", os.defpath))
+    if path is None:
+        return False
+    path = os.path.realpath(path)
+    env = {"PATH": os.environ.get("PATH", os.defpath), "LC_ALL": "C",
+           "NO_COLOR": "1", "OP_COLOR": "never"}
+    pending = {"signal": None}
+    context = _ReadContext(timeout=3, pending=pending)
+    old_handlers = {}
+
+    def interrupted(signum, _frame):
+        if pending["signal"] is None:
+            pending["signal"] = signum
+
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            old_handlers[sig] = signal.signal(sig, interrupted)
+        for args in (("--help",), (family, action, "--help")):
+            child = context.spawn([path, *args], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  env=env, start_new_session=True)
+            try:
+                output = context.collect(child)
+            finally:
+                drained = context.cleanup(child)
+            if output is None:
+                output = drained
+            if child.returncode != 0 or output is None or output[0] is None:
+                return False
+            help_text = output[0].decode("utf-8", errors="replace")
+            if args == ("--help",) and OP_IDENTITY not in help_text.lower():
+                return False
+            if candidate in _help_flags(help_text):
+                return True
+    except (OSError, subprocess.SubprocessError, OpreadTimeoutError):
+        return False
+    finally:
+        context.close()
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
+        if pending["signal"] is not None:
+            raise OpreadError(128 + pending["signal"])
+    return False
+
+
 class _CommandParser(argparse.ArgumentParser):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, allow_abbrev=False, **kwargs)
@@ -481,7 +545,24 @@ def _parse_cli_command(arguments):
                 command.add_argument("--account", metavar="ACCOUNT")
             command.add_argument("--reason", metavar="REASON")
             command.set_defaults(item=None, vault=None, account=None)
-    return parser.parse_args(arguments)
+    command, extras = parser.parse_known_args(arguments)
+    if extras:
+        candidate = extras[0].split("=", 1)[0]
+        valid = "--" not in arguments and re.fullmatch(_HELP_FLAG, candidate)
+        try:
+            _validate_json_request(command.family + "-" + command.action,
+                                   command.item, command.vault, command.account)
+            if command.reason is not None:
+                if command.reason.startswith("-"):
+                    raise ValueError("invalid reason")
+                clean_reason(command.reason)
+        except (ValueError, UnicodeError):
+            valid = False
+        if valid and _native_flag(candidate, command.family, command.action):
+            parser.print_usage(sys.stderr)
+            parser.exit(2, f"op-wrapper: unsupported op flag {candidate}\n")
+        parser.error(None)
+    return command
 
 
 def main():

@@ -186,6 +186,52 @@ class OpreadTests(unittest.TestCase):
                 mkdtemp.assert_not_called()
                 popen.assert_not_called()
 
+    def test_structured_unknown_flags_use_fixed_help_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "op"
+            executable.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = --help ] && [ \"$#\" = 1 ]; then\n"
+                "  printf '1Password CLI brings 1Password to your terminal.\\nGlobal Flags:\\n  --debug  debug\\n'\n"
+                "elif [ \"$1\" = item ] && [ \"$2\" = list ] && [ \"$3\" = --help ] && [ \"$#\" = 3 ]; then\n"
+                "  printf 'Flags:\\n  --format string  format\\n'\n"
+                "else exit 1\n"
+                "fi\n"
+            )
+            executable.chmod(0o700)
+            cases = [
+                (["item", "list", "--debug"], "unsupported op flag --debug"),
+                (["item", "list", "--format=SECRET"], "unsupported op flag --format"),
+                (["item", "list", "--format", "SECRET"], "unsupported op flag --format"),
+                (["item", "list", "--typo=SECRET"], "invalid or unsupported arguments"),
+            ]
+            for args, expected in cases:
+                with self.subTest(args=args), \
+                     mock.patch.dict(opread.os.environ, {"PATH": directory}), \
+                     mock.patch.object(opread.sys, "argv", ["opread", *args]), \
+                     contextlib.redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(opread.main(), 2)
+                    self.assertIn(expected, errors.getvalue())
+                    self.assertNotIn("SECRET", errors.getvalue())
+
+    def test_structured_invalid_arguments_skip_help_and_missing_help_is_generic(self):
+        cases = (["item", "get", "name", "--debug"],
+                 ["item", "list", "--", "--debug"],
+                 ["item", "list", "--reason", ".", "--debug"],
+                 ["item", "bad", "--debug"])
+        for args in cases:
+            with self.subTest(args=args), \
+                 mock.patch.object(opread.sys, "argv", ["opread", *args]), \
+                 mock.patch.object(opread, "_native_flag") as lookup, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(opread.main(), 2)
+                lookup.assert_not_called()
+        with mock.patch.dict(opread.os.environ, {"PATH": ""}), \
+             mock.patch.object(opread.sys, "argv", ["opread", "item", "list", "--debug"]), \
+             contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(opread.main(), 2)
+            self.assertIn("invalid or unsupported arguments", errors.getvalue())
+
     def test_read_returns_exact_bytes_and_suppresses_failures(self):
         for data in (b"", b"newline\n\n", b"nul\0\xff", b"x" * 200000):
             child = Child(0)
@@ -846,11 +892,7 @@ class OpreadTests(unittest.TestCase):
             ["item", "get", "secret-item"],
             ["item", "get", "secret-item", "--vau", "secret-vault"],
             ["item", "get", "secret-item", "--vault=", "--account", "secret-account"],
-            ["item", "list", "--format", "secret-format"],
-            ["item", "list", "--include-archive"],
             ["item", "list", "--vault=--secret-option"],
-            ["vault", "list", "--vault", "secret-vault"],
-            ["account", "list", "--account", "secret-account"],
             ["account", "list", "--reason=-secret-reason"],
         )
         for argv in cases:

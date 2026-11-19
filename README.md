@@ -112,4 +112,4 @@ The wrapper adds `--format json` internally for `item get` and all three list co
 
 Other unsupported global `op` flags are `--cache`, `--config`, `--debug`, `--encoding`, `--iso-timestamps`, `--no-color`, `--session`, and `-v` / `--version`. Use `--account` only on the commands listed above.
 
-Unsupported flags cause the wrapper to exit with status 2 before invoking `op`. For unsupported flags, the command parser reports `op-wrapper: invalid or unsupported arguments` without naming the rejected flag.
+Unsupported flags cause the wrapper to exit with status 2. For structured commands, the wrapper checks native help only after an otherwise valid command has an unknown flag; if help identifies the flag, it names it as unsupported. Help failures and unknown flags use a generic error. Field reads retain their existing error path without a help lookup.
