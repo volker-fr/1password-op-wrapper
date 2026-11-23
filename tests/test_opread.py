@@ -146,6 +146,52 @@ class OpreadTests(unittest.TestCase):
         self.assertEqual(opread.desktop_identity(opread.display_label(ref, "Fastmail")),
                          "fooo_section_API_TOKEN_READ_ONLY__Fastmail")
 
+    def test_item_title_overrides_display_only(self):
+        title = "-Service / résumé 👩‍💻"
+        reference = "op://vault/item-id/section/field?attribute=value"
+        child = self.fake_payload(b"credential")
+        with mock.patch.object(opread.subprocess, "Popen", return_value=child) as spawn, \
+             mock.patch.object(opread, "terminate_process_group"):
+            self.assertEqual(opread.read(reference, "backup", item_title=title), b"credential")
+        self.assertEqual(spawn.call_args.args[0][2:], [
+            "--gui-child", reference, title + "/section/field?attribute=value: backup", "/validated/bin/op"])
+
+        child = self.fake_payload(b'{"id":"item-id"}')
+        with mock.patch.object(opread.subprocess, "Popen", return_value=child) as spawn, \
+             mock.patch.object(opread, "terminate_process_group"):
+            self.assertEqual(opread.get_item("item-id", "backup", vault="vault-id",
+                                             account="account-id", item_title=title), {"id": "item-id"})
+        self.assertEqual(spawn.call_args.args[0][2:], [
+            "--gui-item-child", "item-id", "WHOLE ITEM: " + title + ": backup",
+            "/validated/bin/op", "vault-id", "account-id"])
+
+    def test_unsafe_item_title_falls_back_without_changing_selection(self):
+        for title in ("", "  ", "bad\nvalue", "bad\x00value", "bad\u202evalue",
+                      "bad\u2028value", "bad\u2029value", "\ud800", "x" * 4097):
+            with self.subTest(title=repr(title)):
+                child = self.fake_payload(b"credential")
+                with mock.patch.object(opread.subprocess, "Popen", return_value=child) as spawn, \
+                     mock.patch.object(opread, "terminate_process_group"):
+                    self.assertEqual(opread.read("op://vault/item-id/section/field", "backup", item_title=title), b"credential")
+                self.assertEqual(spawn.call_args.args[0][2:], ["--gui-child", "op://vault/item-id/section/field",
+                                 "item-id/section/field: backup", "/validated/bin/op"])
+                child = self.fake_payload(b'{"id":"item-id"}')
+                with mock.patch.object(opread.subprocess, "Popen", return_value=child) as spawn, \
+                     mock.patch.object(opread, "terminate_process_group"):
+                    self.assertEqual(opread.get_item("item-id", "backup", vault="vault-id", item_title=title), {"id": "item-id"})
+                self.assertEqual(spawn.call_args.args[0][2:], ["--gui-item-child", "item-id",
+                                 "WHOLE ITEM: item-id: backup", "/validated/bin/op", "vault-id", ""])
+
+    def test_nonstring_item_title_is_rejected_before_probe(self):
+        for call in (lambda: opread.read("op://vault/item/field", item_title=3),
+                     lambda: opread.get_item("item", vault="vault", item_title=3)):
+            with mock.patch.object(opread, "resolve_op") as resolve, contextlib.redirect_stderr(io.StringIO()) as errors:
+                with self.assertRaises(opread.OpreadError) as caught:
+                    call()
+                self.assertEqual(caught.exception.returncode, 2)
+                self.assertEqual(errors.getvalue(), "")
+                resolve.assert_not_called()
+
     def test_desktop_identity_is_safe_and_bounded(self):
         self.assertEqual(opread.desktop_identity("../a\nb"), ".._a_b")
         self.assertEqual(opread.desktop_identity(".."), "request")

@@ -159,9 +159,12 @@ def validate_reference(value):
         raise ValueError("REF must be a valid op:// reference")
 
 
-def display_label(reference, reason=None):
+def display_label(reference, reason=None, *, item_title=None):
     # The first component is the vault; never expose it in the identity.
     path = reference[len("op://") :].partition("/")[2] or "request"
+    if item_title is not None:
+        _, separator, suffix = path.partition("/")
+        path = item_title + (separator + suffix if separator else "")
     return path + (": " + reason if reason is not None else "")
 
 
@@ -633,15 +636,21 @@ def main():
     return 0
 
 
-def read(reference, reason=None, *, env=None, timeout=None, cancel=None):
-    """Return exact credential bytes with optional timeout and cooperative cancellation."""
-    return _library_read(reference, reason, env, timeout, cancel)
+def read(reference, reason=None, *, item_title=None, env=None, timeout=None, cancel=None):
+    """Return exact bytes; use item_title for display when safe and usable.
+
+    Unsafe or unusable title strings fall back to the reference item component.
+    """
+    return _library_read(reference, reason, env, timeout, cancel, item_title=item_title)
 
 
-def get_item(item, reason=None, *, vault, account=None, env=None, timeout=None, cancel=None):
-    """Return a whole item as a parsed dict; suppress item diagnostics."""
+def get_item(item, reason=None, *, vault, account=None, item_title=None, env=None, timeout=None, cancel=None):
+    """Return an item dict, using a safe, usable item_title for display only.
+
+    Unsafe or unusable title strings fall back to the item selector.
+    """
     return _library_read(item, reason, env, timeout, cancel,
-                         vault=vault, account=account, operation=_ITEM_GET)
+                         vault=vault, account=account, operation=_ITEM_GET, item_title=item_title)
 
 
 def list_items(reason=None, *, vault=None, account=None, env=None, timeout=None, cancel=None):
@@ -661,13 +670,13 @@ def list_accounts(reason=None, *, env=None, timeout=None, cancel=None):
 
 
 def _library_read(reference, reason, env, timeout, cancel, *,
-                  vault=None, account=None, operation=_FIELD):
+                  vault=None, account=None, operation=_FIELD, item_title=None):
     context = None
     try:
         context = _ReadContext(timeout, cancel, diagnostics=False)
         snapshot = dict(os.environ if env is None else env)
         return _read(reference, reason, snapshot, context,
-                     vault=vault, account=account, operation=operation)
+                     vault=vault, account=account, operation=operation, item_title=item_title)
     except Exception as exc:
         kind = type(exc)
         if context is None and kind is _InvalidTimeout:
@@ -751,7 +760,7 @@ def _parse_list_json(output):
     return value
 
 
-def _read(reference, reason, env, context, *, vault=None, account=None, operation=_FIELD):
+def _read(reference, reason, env, context, *, vault=None, account=None, operation=_FIELD, item_title=None):
     is_field = operation == _FIELD
     tempdir = executable = child = None
     output = None
@@ -771,10 +780,21 @@ def _read(reference, reason, env, context, *, vault=None, account=None, operatio
                 if reason.startswith("-"):
                     raise ValueError(UNSUPPORTED_ARGUMENTS_ERROR)
                 clean_reason(reason)
+            if item_title is not None:
+                if not isinstance(item_title, str):
+                    raise ValueError("invalid item title")
+                try:
+                    usable = (bool(item_title.strip()) and len(item_title.encode("utf-8")) <= 4096
+                              and not any(unicodedata.category(c) in ("Cc", "Cf", "Cs", "Zl", "Zp")
+                                          and c != "\u200d" for c in item_title))
+                except UnicodeError:
+                    usable = False
+                if not usable:
+                    item_title = None
             if is_field:
-                label = display_label(reference, reason)
+                label = display_label(reference, reason, item_title=item_title)
             else:
-                label = "WHOLE ITEM: " + reference if operation == _ITEM_GET else _LIST_COMMANDS[operation][1]
+                label = "WHOLE ITEM: " + (item_title if item_title is not None else reference) if operation == _ITEM_GET else _LIST_COMMANDS[operation][1]
                 if reason is not None:
                     label += ": " + reason
             identity = desktop_identity(label)
