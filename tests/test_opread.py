@@ -779,7 +779,7 @@ class OpreadTests(unittest.TestCase):
         self.assertTrue(os.path.basename(args[0]).startswith("WHOLE_ITEM_"))
         self.assertNotIn("private-vault", args[4])
         self.assertNotIn("chosen-account", args[4])
-        self.assertEqual(spawn.call_args.kwargs["stderr"], opread.subprocess.PIPE)
+        self.assertEqual(spawn.call_args.kwargs["stderr"], opread.subprocess.DEVNULL)
         self.assertEqual(spawn.call_args.kwargs["env"]["OP_ACCOUNT"], "chosen-account")
         self.assertEqual(env["OP_ACCOUNT"], "ambient-account")
         self.assertTrue(child.stderr.closed)
@@ -876,7 +876,7 @@ class OpreadTests(unittest.TestCase):
             self.assertEqual(resolve.call_args.args[0]["OP_ACCOUNT"], account)
             self.assertEqual(kwargs["env"]["OP_ACCOUNT"], account)
             self.assertEqual(kwargs["stdin"], opread.subprocess.DEVNULL)
-            self.assertEqual(kwargs["stderr"], opread.subprocess.PIPE)
+            self.assertEqual(kwargs["stderr"], opread.subprocess.DEVNULL)
             with self.fake_gui() as gui, mock.patch.object(opread.sys, "argv", args[1:]):
                 gui.popen.return_value = Child(0)
                 def drive_gui():
@@ -1358,6 +1358,133 @@ class OpreadTests(unittest.TestCase):
                 else:
                     self.assertEqual(self.run_real_read(code, item=True, timeout=3), {"id": "value"})
             self.assertEqual(errors.getvalue(), "")
+
+    def test_library_reports_gui_setup_failures_over_the_helper_pipe(self):
+        source = str(SCRIPT.parent / "lib" / "opread.py")
+        missing_gi = "sys.modules['gi'] = None"
+        gtk_unavailable = (
+            "gi = sys.modules['gi'] = types.ModuleType('gi')\n"
+            "def require_gtk(*args): raise ValueError('private GTK import detail')\n"
+            "gi.require_version = require_gtk"
+        )
+        no_display = (
+            "gi = sys.modules['gi'] = types.ModuleType('gi')\n"
+            "gi.require_version = lambda *args: None\n"
+            "repo = sys.modules['gi.repository'] = types.ModuleType('gi.repository')\n"
+            "repo.Gtk = types.SimpleNamespace(init_check=lambda: (False, []))\n"
+            "repo.Gdk = repo.GLib = None"
+        )
+        for setup, status, expected in (
+            (missing_gi, 69, "cannot load GTK 3 bindings: No module named 'gi'"),
+            (gtk_unavailable, 69, "cannot load GTK 3 bindings"),
+            (no_display, 2, "cannot connect to graphical session"),
+        ):
+            code = ("import runpy, sys, types\n"
+                    "sys.stderr.write('private startup warning\\n')\n"
+                    + setup + "\n"
+                    "sys.argv = ['opread', '--gui-child', 'op://vault/item/field', 'label', '/synthetic/op']\n"
+                    f"runpy.run_path({source!r}, run_name='__main__')\n")
+            for item in (False, True):
+                with self.subTest(diagnostic=expected, item=item):
+                    with self.assertRaises(opread.OpreadError) as error:
+                        self.run_real_read(code, item=item, timeout=3)
+                    self.assertEqual(error.exception.returncode, status)
+                    self.assertEqual(error.exception.diagnostic, expected)
+
+    def test_structured_cli_reports_only_known_helper_reasons(self):
+        message = "cannot connect to graphical session\n"
+        for reason, expected in ((b"D", message), (b"DD", ""), (b"", "")):
+            def spawn(*args, **kwargs):
+                os.write(kwargs["pass_fds"][0], reason)
+                child = Child(2)
+                child.communicate = mock.Mock(return_value=(b"", message.encode()))
+                return child
+
+            with self.subTest(reason=reason), \
+                 mock.patch.object(opread.sys, "argv", ["op-wrapper.py", "account", "list"]), \
+                 mock.patch.object(opread.subprocess, "Popen", side_effect=spawn), \
+                 mock.patch.object(opread, "terminate_process_group"), \
+                 contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(opread.main(), 2)
+                self.assertEqual(errors.getvalue(), expected)
+
+    def test_structured_cli_preserves_status_when_stderr_is_unavailable(self):
+        import subprocess
+        from textwrap import dedent
+
+        harness = dedent("""
+            import sys
+            from unittest import mock
+            from lib import opread
+
+            sys.argv = ["op-wrapper.py", "account", "list"]
+            failure = opread.OpreadError(2, diagnostic="cannot connect to graphical session")
+            with mock.patch.object(opread, "_cli_read", side_effect=failure):
+                raise SystemExit(opread.main())
+        """)
+        argv = [sys.executable, "-c", harness]
+        close_stderr = "import os, sys; os.close(2); os.execv(sys.argv[1], sys.argv[1:])"
+        closed = subprocess.run([sys.executable, "-c", close_stderr, *argv], cwd=SCRIPT.parent,
+                                stdout=subprocess.PIPE, timeout=8)
+        reader, writer = os.pipe()
+        os.close(reader)
+        try:
+            broken = subprocess.run(argv, cwd=SCRIPT.parent, stdout=subprocess.PIPE, stderr=writer, timeout=8)
+        finally:
+            os.close(writer)
+        for result in (closed, broken):
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, b"")
+
+    def test_library_rejects_diagnostics_from_cancellation_callbacks(self):
+        for diagnostic in (PRIVATE_SENTINEL, "cannot connect to graphical session"):
+            error = opread.OpreadError(42)
+            error.diagnostic = diagnostic
+            cancel = mock.Mock()
+            cancel.is_set.side_effect = error
+            with self.subTest(diagnostic=diagnostic), self.assertRaises(opread.OpreadError) as raised:
+                opread.read("op://Private/item/field", cancel=cancel)
+            self.assertEqual(raised.exception.returncode, 42)
+            self.assertIsNone(raised.exception.diagnostic)
+        opread.resolve_op.assert_not_called()
+
+    def test_closed_standard_descriptors_preserve_helper_diagnostic_and_stdout(self):
+        import subprocess
+        from textwrap import dedent
+
+        harness = dedent("""
+            import os
+            import sys
+            from lib import opread
+
+            os.close(0)
+            os.close(1)
+            helper = (
+                "import os, subprocess, sys; "
+                f"fd = int(os.environ.pop({opread._GUI_DIAGNOSTIC_FD!r})); "
+                "os.set_inheritable(fd, False); "
+            )
+
+            def run(code):
+                context = opread._ReadContext(timeout=3)
+                return opread._run_gui_child(
+                    context, [sys.executable, "-S", "-c", helper + code],
+                    dict(os.environ), inherit_stderr=False)
+
+            try:
+                run("os.write(fd, b'D'); sys.exit(2)")
+            except opread.OpreadError as error:
+                assert error.returncode == 2
+                assert error.diagnostic == "cannot connect to graphical session"
+            else:
+                raise AssertionError("expected GUI setup failure")
+
+            native = "import os; os.write(1, b'synthetic output')"
+            assert run(f"raise SystemExit(subprocess.call([sys.executable, '-S', '-c', {native!r}]))") == b"synthetic output"
+        """)
+        result = subprocess.run([sys.executable, "-c", harness], cwd=SCRIPT.parent,
+                                capture_output=True, timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
 
     def test_real_running_read_timeout_and_cancel_suppress_partial_payload(self):
         import subprocess

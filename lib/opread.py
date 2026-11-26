@@ -2,6 +2,9 @@
 """Private GTK prompt that gives an op read request a visible reason label."""
 
 import argparse
+from contextlib import ExitStack
+import fcntl
+from io import UnsupportedOperation
 import json
 import math
 import os
@@ -22,6 +25,16 @@ UNSUPPORTED_ARGUMENTS_ERROR = (
     f"use: {_CLI_NAME} REF [REASON]"
 )
 _INVALID_TIMEOUT_MESSAGE = "timeout must be a finite nonnegative number of seconds"
+_GUI_DIAGNOSTIC_FD = "_OPREAD_GUI_DIAGNOSTIC_FD"
+_MISSING_GI = b"I"
+_GTK_UNAVAILABLE = b"G"
+_NO_DISPLAY = b"D"
+_GTK_BINDINGS_ERROR = "cannot load GTK 3 bindings"
+_SAFE_CHILD_DIAGNOSTICS = {
+    _MISSING_GI: f"{_GTK_BINDINGS_ERROR}: No module named 'gi'",
+    _GTK_UNAVAILABLE: _GTK_BINDINGS_ERROR,
+    _NO_DISPLAY: "cannot connect to graphical session",
+}
 _FIELD = "read"
 _ITEM_GET = "item-get"
 _LIST_COMMANDS = {
@@ -175,7 +188,20 @@ def desktop_identity(label):
     return "request" if safe in ("", ".", "..") else safe
 
 
+def _report_gui_failure(fd, reason, *, detail=None):
+    if fd is not None:
+        os.write(fd, reason)
+    elif detail is not None:
+        print(f"{_GTK_BINDINGS_ERROR}: {detail}", file=sys.stderr)
+    else:
+        print(_SAFE_CHILD_DIAGNOSTICS[reason], file=sys.stderr)
+
+
 def gui(reference, label, op_path, *, vault=None, account=None, operation=None):
+    diagnostic_fd = os.environ.pop(_GUI_DIAGNOSTIC_FD, None)
+    if diagnostic_fd is not None:
+        diagnostic_fd = int(diagnostic_fd)
+        os.set_inheritable(diagnostic_fd, False)
     if operation is None:
         operation = _FIELD if vault is None else _ITEM_GET
     if operation == _FIELD:
@@ -199,11 +225,12 @@ def gui(reference, label, op_path, *, vault=None, account=None, operation=None):
         gi.require_version("Gtk", "3.0")
         from gi.repository import Gtk, Gdk, GLib
     except (ImportError, ValueError) as exc:
-        print("cannot load GTK 3 bindings: " + str(exc), file=sys.stderr)
+        reason = _MISSING_GI if isinstance(exc, ModuleNotFoundError) and exc.name == "gi" else _GTK_UNAVAILABLE
+        _report_gui_failure(diagnostic_fd, reason, detail=exc)
         return 69
 
     if not Gtk.init_check()[0]:
-        print("cannot connect to graphical session", file=sys.stderr)
+        _report_gui_failure(diagnostic_fd, _NO_DISPLAY)
         return 2
     identity = label
     GLib.set_prgname(identity)
@@ -330,11 +357,14 @@ def terminate_process_group(child, *, deadline=None):
 
 
 class OpreadError(Exception):
-    """A credential read failed; returncode is the CLI-compatible status."""
+    """A read failed; diagnostic is either None or a sanitized public message."""
 
-    def __init__(self, returncode):
-        self.returncode = returncode
-        super().__init__("opread failed with status " + str(returncode))
+    def __init__(self, returncode, *, diagnostic=None):
+        self.returncode = returncode if type(returncode) is int and 1 <= returncode <= 255 else 69
+        self.diagnostic = (
+            diagnostic if type(diagnostic) is str and diagnostic in _SAFE_CHILD_DIAGNOSTICS.values() else None
+        )
+        super().__init__("opread failed with status " + str(self.returncode))
 
 
 class OpreadTimeoutError(OpreadError):
@@ -378,6 +408,7 @@ class _ReadContext:
         self.cancel = cancel
         self.pending = pending
         self.diagnostics = diagnostics
+        self.gui_failure = None
         self.children = []
         self.cleanup_remaining = 5.0
         self.cleanup_failed = False
@@ -568,6 +599,22 @@ def _parse_cli_command(arguments):
     return command
 
 
+def _write_diagnostic(message):
+    stderr = sys.stderr
+    if stderr is None:
+        return
+    try:
+        try:
+            fd = stderr.fileno()
+        except (AttributeError, UnsupportedOperation):
+            print(message, file=stderr, flush=True)
+        else:
+            # Avoid leaving a failed buffered write for Python to flush at exit.
+            os.write(fd, (message + "\n").encode())
+    except (OSError, ValueError):
+        pass
+
+
 def main():
     if len(sys.argv) == 2 and sys.argv[1] == "--check-runtime":
         return check_runtime()
@@ -622,6 +669,8 @@ def main():
             reason = arguments[1] if len(arguments) == 2 else None
             output = _cli_read(reference, reason)
     except OpreadError as exc:
+        if exc.diagnostic is not None:
+            _write_diagnostic(exc.diagnostic)
         return exc.returncode
     try:
         sys.stdout.buffer.write(output)
@@ -685,9 +734,11 @@ def _library_read(reference, reason, env, timeout, cancel, *,
             failure = OpreadTimeoutError()
         elif kind is OpreadCancelledError:
             failure = OpreadCancelledError()
+        elif kind is OpreadError:
+            diagnostic = exc.diagnostic if context is not None and exc is context.gui_failure else None
+            failure = OpreadError(getattr(exc, "returncode", None), diagnostic=diagnostic)
         else:
-            status = getattr(exc, "returncode", None) if kind is OpreadError else None
-            failure = OpreadError(status if type(status) is int and 1 <= status <= 255 else 69)
+            failure = OpreadError(69)
 
     try:
         raise failure from None
@@ -760,9 +811,52 @@ def _parse_list_json(output):
     return value
 
 
+def _run_gui_child(context, args, env, *, inherit_stderr):
+    env.pop(_GUI_DIAGNOSTIC_FD, None)
+    reader = None
+    pass_fds = ()
+    stderr = None if inherit_stderr else subprocess.DEVNULL
+    with ExitStack() as descriptors:
+        if not inherit_stderr:
+            # The GUI helper sends one fixed reason. Native op stderr goes to DEVNULL.
+            reader, writer = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+            descriptors.callback(os.close, reader)
+            if writer < 3:
+                # Popen replaces standard descriptors in the child.
+                try:
+                    child_writer = fcntl.fcntl(writer, fcntl.F_DUPFD_CLOEXEC, 3)
+                finally:
+                    os.close(writer)
+                writer = child_writer
+            descriptors.callback(os.close, writer)
+            env[_GUI_DIAGNOSTIC_FD] = str(writer)
+            pass_fds = (writer,)
+        child = context.spawn(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=stderr, start_new_session=True, env=env, pass_fds=pass_fds)
+        collected = context.collect(child)
+        status = child.returncode
+        status = status if status >= 0 else 128 - status
+        drained = context.cleanup(child)
+        if collected is None:
+            collected = drained
+        if status:
+            diagnostic = None
+            if reader is not None:
+                try:
+                    # A second byte makes an overlong message fail the lookup.
+                    diagnostic = _SAFE_CHILD_DIAGNOSTICS.get(os.read(reader, 2))
+                except BlockingIOError:
+                    pass
+            context.gui_failure = OpreadError(status, diagnostic=diagnostic)
+            raise context.gui_failure
+        if collected is None:
+            raise RuntimeError("cannot collect complete output")
+        return collected[0]
+
+
 def _read(reference, reason, env, context, *, vault=None, account=None, operation=_FIELD, item_title=None):
     is_field = operation == _FIELD
-    tempdir = executable = child = None
+    tempdir = executable = None
     output = None
     failure = None
     try:
@@ -835,28 +929,13 @@ def _read(reference, reason, env, context, *, vault=None, account=None, operatio
         child_env["PYTHONHOME"] = python_home
         child_env["OP_BIOMETRIC_UNLOCK_ENABLED"] = "true"
         args = [executable, os.path.abspath(__file__)]
-        stderr = None if context.diagnostics else subprocess.DEVNULL
         if is_field:
             args += ["--gui-child", reference, label, op_path]
         elif operation == _ITEM_GET:
             args += ["--gui-item-child", reference, label, op_path, vault, account or ""]
         else:
             args += ["--gui-list-child", operation, label, op_path, vault or "", account or ""]
-        if not is_field:
-            stderr = subprocess.PIPE
-        child = context.spawn(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                              stderr=stderr, start_new_session=True, env=child_env)
-        collected = context.collect(child)
-        status = child.returncode
-        status = status if status >= 0 else 128 - status
-        drained = context.cleanup(child)
-        if collected is None:
-            collected = drained
-        if status:
-            raise OpreadError(status)
-        if collected is None:
-            raise RuntimeError("cannot collect complete output")
-        output = collected[0]
+        output = _run_gui_child(context, args, child_env, inherit_stderr=is_field and context.diagnostics)
         context.check()
         if not is_field:
             parsed = _parse_item_json(output) if operation == _ITEM_GET else _parse_list_json(output)
